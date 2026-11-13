@@ -1,0 +1,98 @@
+name: vaultflow
+
+# VaultFlow dev orchestration — P0-6 baseline.
+# Wave-2 window I1 adds vault-signer (Rust/mTLS) + gateway-core (Go) service
+# blocks — see commented templates at the bottom.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vaultflow-postgres
+    environment:
+      POSTGRES_USER: vaultflow
+      POSTGRES_PASSWORD: vaultflow
+      POSTGRES_DB: vaultflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vaultflow -d vaultflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: vaultflow-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  anvil-a: # primary dev chain — chain_id 31337
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: vaultflow-anvil-a
+    entrypoint: ["anvil"]
+    command: ["--host", "0.0.0.0", "--port", "8545", "--chain-id", "31337"]
+    ports:
+      - "8545:8545"
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  anvil-b: # secondary dev chain — chain_id 31338
+    image: ghcr.io/foundry-rs/foundry:latest
+    container_name: vaultflow-anvil-b
+    entrypoint: ["anvil"]
+    command: ["--host", "0.0.0.0", "--port", "8545", "--chain-id", "31338"]
+    ports:
+      - "8546:8545" # host 8546 -> container anvil 8545
+    healthcheck:
+      test: ["CMD-SHELL", "cast block-number --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # TODO Wave-2 window I1: vault-signer service (Rust tonic mTLS)
+  # vault-signer:
+  #   build: ./services/vault-signer
+  #   container_name: vaultflow-signer
+  #   volumes:
+  #     - ./certs:/etc/vaultflow/certs:ro   # from scripts/gen-mtls-certs.sh
+  #   expose:
+  #     - "50051"                          # internal mTLS gRPC only
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #
+  # TODO Wave-2 window I1: gateway-core service (Go modular monolith)
+  # gateway-core:
+  #   build: ./services/gateway-core
+  #   container_name: vaultflow-gateway
+  #   environment:
+  #     DATABASE_URL: postgres://vaultflow:vaultflow@postgres:5432/vaultflow
+  #     REDIS_URL: redis://redis:6379
+  #     SIGNER_ADDR: vault-signer:50051
+  #   ports:
+  #     - "8080:8080"
+  #   depends_on:
+  #     postgres: { condition: service_healthy }
+  #     redis:    { condition: service_healthy }
+  #     anvil-a:  { condition: service_started }
+  #     anvil-b:  { condition: service_started }
+  #     vault-signer: { condition: service_started }
+  # ---------------------------------------------------------------------------
+
+volumes:
+  pgdata:

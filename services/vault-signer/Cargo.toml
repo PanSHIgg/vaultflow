@@ -1,0 +1,42 @@
+[package]
+name = "vault-signer"
+version = "0.1.0"
+edition = "2021"
+description = "VaultFlow process-isolated signing vault (mTLS gRPC + zero-trust policy firewall)"
+license = "MIT"
+
+# Standalone crate: explicitly NOT a member of any future repo-level workspace.
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tonic = "0.12"
+tonic-reflection = { version = "0.12", optional = true }
+prost = "0.13"
+prost-types = "0.13"
+k256 = { version = "0.13", features = ["ecdsa", "sha256"] }
+sha2 = "0.10"
+rusqlite = { version = "0.32", features = ["bundled"] }
+secrecy = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+aes-gcm = "0.10"
+ed25519-dalek = "2"
+alloy-primitives = "1" # U256 / Address / B256 / keccak256
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+cfg-if = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_Memory"] }
+
+[build-dependencies]
+tonic-build = "0.12"
+protoc-bin-vendored = "3"

@@ -1,0 +1,33 @@
+# --- Project docs (design/progress notes stay local, untracked) ---
+*.md
+
+# --- Secrets & local env (NEVER commit) ---
+.env
+.env.*
+certs/
+*.pem
+*.key
+
+# --- Rust (services/vault-signer) ---
+target/
+Cargo.lock.bak
+
+# --- Go ---
+*.test
+*.out
+
+# --- Node / Next.js (web) ---
+node_modules/
+.next/
+dist/
+*.tsbuildinfo
+
+# --- Foundry (contracts) ---
+contracts/cache/
+contracts/out/
+contracts/broadcast/
+
+# --- Misc ---
+*.log
+coverage/
+.DS_Store

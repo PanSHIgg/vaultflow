@@ -1,0 +1,1194 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VaultFlow 智能合约完全图解教程 — 从零看懂 CREATE2 免 Gas 归集架构</title>
+  <style>
+    :root {
+      --bg: #090d16;
+      --bg-elev: #111827;
+      --bg-card: #162033;
+      --bg-code: #0b111e;
+      --border: #24324d;
+      --border-hi: #3b82f6;
+      --text: #e5edf8;
+      --text-dim: #94a3b8;
+      --text-muted: #64748b;
+      --blue: #3b82f6;
+      --cyan: #06b6d4;
+      --green: #10b981;
+      --amber: #f59e0b;
+      --red: #ef4444;
+      --purple: #8b5cf6;
+      --mono: "JetBrains Mono", "Cascadia Code", Consolas, "Courier New", monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      line-height: 1.7;
+      font-size: 15px;
+    }
+
+    /* Top Nav */
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      background: rgba(9, 13, 22, 0.9);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 12px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      font-size: 16px;
+      letter-spacing: 0.3px;
+    }
+    .brand-badge {
+      background: linear-gradient(135deg, var(--blue), var(--cyan));
+      color: #fff;
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 4px;
+    }
+    .nav-links {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .nav-links a {
+      color: var(--text-dim);
+      text-decoration: none;
+      font-size: 13px;
+      padding: 5px 10px;
+      border-radius: 6px;
+      border: 1px solid transparent;
+      transition: all 0.15s;
+    }
+    .nav-links a:hover {
+      color: var(--text);
+      border-color: var(--border);
+      background: var(--bg-elev);
+    }
+
+    .container {
+      max-width: 1160px;
+      margin: 0 auto;
+      padding: 36px 24px 96px;
+    }
+
+    /* Hero */
+    .hero {
+      background: radial-gradient(circle at top right, rgba(59, 130, 246, 0.16), transparent 55%),
+                  linear-gradient(180deg, var(--bg-elev), var(--bg));
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 32px;
+      margin-bottom: 36px;
+    }
+    .hero-tag {
+      display: inline-block;
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--cyan);
+      border: 1px solid rgba(6, 182, 212, 0.35);
+      background: rgba(6, 182, 212, 0.08);
+      padding: 3px 10px;
+      border-radius: 999px;
+      margin-bottom: 12px;
+    }
+    .hero h1 {
+      font-size: 28px;
+      line-height: 1.35;
+      margin-bottom: 12px;
+    }
+    .hero p {
+      color: var(--text-dim);
+      max-width: 860px;
+      font-size: 15.5px;
+    }
+    .key-takeaway {
+      margin-top: 20px;
+      padding: 14px 18px;
+      background: rgba(16, 185, 129, 0.08);
+      border-left: 3px solid var(--green);
+      border-radius: 6px;
+      font-size: 14.5px;
+    }
+
+    /* Section */
+    .section {
+      margin-bottom: 44px;
+      scroll-margin-top: 76px;
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .step-num {
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--blue);
+      background: rgba(59, 130, 246, 0.12);
+      border: 1px solid rgba(59, 130, 246, 0.35);
+      padding: 4px 10px;
+      border-radius: 6px;
+    }
+    .section h2 {
+      font-size: 21px;
+      font-weight: 700;
+    }
+    .section-desc {
+      color: var(--text-dim);
+      margin-bottom: 20px;
+    }
+
+    /* Cards & Grids */
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 22px;
+    }
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
+      gap: 20px;
+    }
+    @media (max-width: 600px) {
+      .grid-2 { grid-template-columns: 1fr; }
+    }
+
+    /* Buttons */
+    .btn {
+      cursor: pointer;
+      font-family: var(--sans);
+      font-size: 13.5px;
+      font-weight: 600;
+      padding: 8px 15px;
+      border-radius: 7px;
+      border: 1px solid var(--border);
+      background: var(--bg-elev);
+      color: var(--text);
+      transition: all 0.15s;
+    }
+    .btn:hover:not(:disabled) {
+      border-color: var(--blue);
+      background: rgba(59, 130, 246, 0.15);
+    }
+    .btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .btn-primary {
+      background: var(--blue);
+      border-color: var(--blue);
+      color: #fff;
+    }
+    .btn-primary:hover:not(:disabled) {
+      background: #2563eb;
+    }
+    .btn-green {
+      background: var(--green);
+      border-color: var(--green);
+      color: #052e16;
+    }
+    .btn-green:hover:not(:disabled) {
+      background: #059669;
+      color: #fff;
+    }
+
+    /* Ledger Table Demo (Section 1) */
+    .db-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: var(--mono);
+      font-size: 13px;
+      margin-top: 12px;
+      background: var(--bg-code);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .db-table th, .db-table td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+      text-align: left;
+    }
+    .db-table th {
+      background: rgba(59, 130, 246, 0.1);
+      color: var(--cyan);
+      font-weight: 600;
+    }
+    .highlight-row {
+      animation: flashRow 1.1s ease;
+      background: rgba(16, 185, 129, 0.16);
+    }
+    @keyframes flashRow {
+      0% { background: rgba(16, 185, 129, 0.45); }
+      100% { background: rgba(16, 185, 129, 0.12); }
+    }
+
+    .pill {
+      display: inline-block;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      padding: 2px 8px;
+      border-radius: 4px;
+      font-weight: 600;
+    }
+    .pill-empty { background: rgba(148, 163, 184, 0.15); color: var(--text-dim); }
+    .pill-deployed { background: rgba(16, 185, 129, 0.18); color: var(--green); }
+    .pill-warn { background: rgba(245, 158, 11, 0.18); color: var(--amber); }
+    .pill-err { background: rgba(239, 68, 68, 0.18); color: var(--red); }
+    .pill-info { background: rgba(59, 130, 246, 0.18); color: #60a5fa; }
+
+    /* Interactive Sandbox (Section 2) */
+    .sandbox-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .stats-bar {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .stat-box {
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      text-align: center;
+    }
+    .stat-label { font-size: 11.5px; color: var(--text-dim); }
+    .stat-val { font-family: var(--mono); font-size: 15px; font-weight: 700; margin-top: 2px; }
+
+    .addr-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .addr-item {
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-family: var(--mono);
+      font-size: 12.5px;
+      transition: border-color 0.25s, transform 0.2s;
+    }
+    .addr-item.active {
+      border-color: var(--cyan);
+    }
+    .log-console {
+      background: #060911;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 12px;
+      font-family: var(--mono);
+      font-size: 12px;
+      height: 132px;
+      overflow-y: auto;
+      color: #cbd5e1;
+      margin-top: 12px;
+    }
+    .log-line { margin-bottom: 4px; }
+    .log-err { color: #f87171; }
+    .log-ok { color: #34d399; }
+    .log-warn { color: #fbbf24; }
+
+    /* CREATE2 Calculator (Section 3) */
+    .calc-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+    .field label {
+      display: block;
+      font-size: 12.5px;
+      color: var(--text-dim);
+      margin-bottom: 5px;
+    }
+    .field input, .field select {
+      width: 100%;
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 8px 10px;
+      border-radius: 6px;
+      font-family: var(--mono);
+      font-size: 13px;
+    }
+    .formula-box {
+      background: var(--bg-code);
+      border: 1px dashed var(--border-hi);
+      border-radius: 8px;
+      padding: 14px 16px;
+      font-family: var(--mono);
+      font-size: 13px;
+      word-break: break-all;
+    }
+
+    /* Call Chain Visualizer (Section 4) */
+    .flow-diagram {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin: 18px 0;
+    }
+    @media (max-width: 860px) {
+      .flow-diagram { grid-template-columns: 1fr; }
+    }
+    .flow-node {
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 14px;
+      position: relative;
+      transition: all 0.25s;
+    }
+    .flow-node.current {
+      border-color: var(--green);
+      box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.2);
+    }
+    .flow-node h4 {
+      font-size: 14px;
+      margin-bottom: 6px;
+      color: var(--cyan);
+    }
+    .flow-node p {
+      font-size: 12.5px;
+      color: var(--text-dim);
+    }
+    .context-badge {
+      margin-top: 10px;
+      padding-top: 8px;
+      border-top: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 11.5px;
+    }
+
+    /* Code Tabs (Section 5) */
+    .tabs {
+      display: flex;
+      gap: 6px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 10px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+    .tab-btn {
+      cursor: pointer;
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      padding: 8px 14px;
+      border-radius: 7px;
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .tab-btn.active {
+      background: var(--blue);
+      border-color: var(--blue);
+      color: #fff;
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+    pre.code-block {
+      background: var(--bg-code);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px;
+      overflow-x: auto;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.65;
+      color: #dbeafe;
+    }
+    .c-cmt { color: #34d399; }
+    .c-kw { color: #c084fc; }
+    .c-fn { color: #60a5fa; }
+    .c-str { color: #fbbf24; }
+
+    /* Arbitrum vs BSC Table */
+    .compare-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    .compare-table th, .compare-table td {
+      border: 1px solid var(--border);
+      padding: 12px 14px;
+      text-align: left;
+      vertical-align: top;
+    }
+    .compare-table th {
+      background: var(--bg-elev);
+      color: var(--cyan);
+    }
+
+    /* FAQ Accordion */
+    .qa-item {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      margin-bottom: 10px;
+      background: var(--bg-card);
+      overflow: hidden;
+    }
+    .qa-q {
+      width: 100%;
+      text-align: left;
+      background: none;
+      border: none;
+      color: var(--text);
+      padding: 15px 18px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .qa-q:hover { background: rgba(255, 255, 255, 0.03); }
+    .qa-a {
+      display: none;
+      padding: 0 18px 16px;
+      color: var(--text-dim);
+      border-top: 1px solid var(--border);
+      padding-top: 14px;
+      font-size: 14.5px;
+    }
+    .qa-item.open .qa-a { display: block; }
+  </style>
+</head>
+<body>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-badge">VAULTFLOW</span>
+      <span>智能合约底层原理交互式图解</span>
+    </div>
+    <nav class="nav-links">
+      <a href="#sec1">01. 破除误区：钱在哪？</a>
+      <a href="#sec2">02. 传统 EOA vs 合约归集沙盒</a>
+      <a href="#sec3">03. CREATE2 预言地址计算器</a>
+      <a href="#sec4">04. 45字节代理与借壳执行</a>
+      <a href="#sec5">05. 四个合约逐行源码拆解</a>
+      <a href="#sec6">06. Arbitrum vs BSC 实战大坑</a>
+    </nav>
+  </header>
+
+  <main class="container">
+
+    <!-- HERO -->
+    <section class="hero">
+      <span class="hero-tag">FOR BACKEND & FULL-STACK ENGINEERS</span>
+      <h1>为什么做稳定币收款与交易所归集，要自己写这 4 个智能合约？</h1>
+      <p>
+        如果你只写过后端 Go/Rust，很容易觉得“区块链转账就是生成公私钥地址收 USDT”。但只要真做过归集就会撞墙：
+        <strong>100 个充值地址收了 USDT，里面却没有 ETH/BNB 付手续费，被迫先发 100 笔交易打油钱、再发 100 笔交易收款</strong>。
+        本页不讲玄学概念，用后端工程师最熟悉的「数据库表 + 函数调用栈」视角，带你把全部 4 个合约彻底看透。
+      </p>
+      <div class="key-takeaway">
+        <strong>核心一句话先记住：</strong> 我们写的合约不发行任何代币，它只是一套<strong>「无私钥的自动归集管道」</strong>——平时在链下 0 成本算出专属收款地址，收款后由公司热钱包出 <strong>1 次</strong> 手续费，在 <strong>1 笔交易</strong> 里把几十个地址里的真 USDT/USDC 全抽进冷钱包。
+      </div>
+    </section>
+
+    <!-- SECTION 1 -->
+    <section id="sec1" class="section">
+      <div class="section-header">
+        <span class="step-num">STEP 01</span>
+        <h2>破除第一大直觉误区：你的钱包地址里，其实根本没有“装着”USDT！</h2>
+      </div>
+      <p class="section-desc">
+        很多人的第一个疑问是：<strong>“你说订单下单时合约还没部署到链上，那是个空地址！用户把 100 USDT 转给一个还不存在的空地址，钱不会丢吗？！”</strong><br/>
+        答案是：<strong>绝对不会丢！</strong> 因为在 Arbitrum 或 BSC 上，所有人的 USDT 都只存在「Tether 官方合约内部的一张大哈希表」里，跟后端的 MySQL 余额表一模一样：
+      </p>
+
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:12px;">
+          <div>
+            <strong>互动实验：模拟用户在 Arbitrum 上给一个「尚未部署代码的空地址」转 100 USDT</strong>
+            <div style="font-size:13px; color:var(--text-dim);">观察下方 Tether 官方 USDT 合约内部的 <code>mapping(address =&gt; uint256) balances</code> 账本发生了什么变化</div>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button id="btnSimTransfer" class="btn btn-primary" onclick="simErc20Transfer()">1. 用户向空地址 0x8888 转 100 USDT</button>
+            <button id="btnSimDeploySweep" class="btn btn-green" onclick="simDeployAndSweep()" disabled>2. 稍后部署合约并转入冷钱包</button>
+            <button class="btn" onclick="resetSec1()">重置</button>
+          </div>
+        </div>
+
+        <table class="db-table">
+          <thead>
+            <tr>
+              <th>地址 (Address 主键)</th>
+              <th>地址身份与链上代码状态</th>
+              <th>原生 Gas 余额 (ETH / BNB)</th>
+              <th>USDT 官方合约里的记账余额</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr id="rowUser">
+              <td>0xAlice...1111 (付款用户)</td>
+              <td><span class="pill pill-info">普通私钥钱包 (EOA)</span></td>
+              <td>0.02 ETH</td>
+              <td id="balUser">500.00 USDT</td>
+            </tr>
+            <tr id="rowVault">
+              <td>0x8888...beef (订单专属地址)</td>
+              <td id="vaultState"><span class="pill pill-empty">空地址 (0 字节代码，无私钥！)</span></td>
+              <td><strong>0.00 ETH (永远是 0！)</strong></td>
+              <td id="balVault">0.00 USDT</td>
+            </tr>
+            <tr id="rowCold">
+              <td>0xCold...9999 (公司冷金库)</td>
+              <td><span class="pill pill-info">离线硬件冷钱包</span></td>
+              <td>0.00 ETH</td>
+              <td id="balCold">10,000.00 USDT</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div id="sec1Explain" style="margin-top:14px; padding:12px 14px; background:var(--bg-code); border-radius:8px; font-size:13.5px; color:var(--text-dim);">
+          点击上方按钮「1. 用户向空地址 0x8888 转 100 USDT」看看会发生什么。
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 2 -->
+    <section id="sec2" class="section">
+      <div class="section-header">
+        <span class="step-num">STEP 02</span>
+        <h2>直观对比：传统私钥钱包归集 vs VaultFlow 智能合约归集</h2>
+      </div>
+      <p class="section-desc">
+        假设现在 BSC 链上有 <strong>3 个订单</strong> 都收到了 <code>100 USDT</code>。你亲自点一遍左右两边的归集按钮，就能切身体会为什么交易所都在淘汰左边、改用右边：
+      </p>
+
+      <div class="grid-2">
+        <!-- LEFT: LEGACY EOA -->
+        <div class="card">
+          <div class="sandbox-header">
+            <div>
+              <span class="pill pill-err">你一年前的传统做法</span>
+              <h3 style="font-size:17px; margin-top:4px;">方案 A：生成普通私钥钱包 (EOA)</h3>
+            </div>
+            <button class="btn" onclick="resetLegacy()">重置</button>
+          </div>
+
+          <div class="stats-bar">
+            <div class="stat-box">
+              <div class="stat-label">链上交易笔数</div>
+              <div id="legTxCount" class="stat-val">0 笔</div>
+            </div>
+            <div class="stat-box">
+              <div class="stat-label">服务器需管私钥</div>
+              <div class="stat-val" style="color:var(--red);">3 把 (+热钱包)</div>
+            </div>
+            <div class="stat-box">
+              <div class="stat-label">残留废弃 BNB 粉尘</div>
+              <div id="legDust" class="stat-val">0 BNB</div>
+            </div>
+          </div>
+
+          <div class="addr-list">
+            <div class="addr-item"><span>订单1: 0xEOA_1</span><span id="legA1">100 USDT | 0 BNB</span></div>
+            <div class="addr-item"><span>订单2: 0xEOA_2</span><span id="legA2">100 USDT | 0 BNB</span></div>
+            <div class="addr-item"><span>订单3: 0xEOA_3</span><span id="legA3">100 USDT | 0 BNB</span></div>
+            <div class="addr-item" style="border-color:var(--amber);"><span>公司冷钱包</span><span id="legCold">0 USDT</span></div>
+          </div>
+
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button id="btnLegTry" class="btn" onclick="legacyTryDirect()">直接转出 USDT？</button>
+            <button id="btnLegGas" class="btn btn-primary" onclick="legacySendGas()">第1步：发3笔交易打 BNB 油钱</button>
+            <button id="btnLegSweep" class="btn btn-green" onclick="legacySweep()" disabled>第2步：用3把私钥发3笔归集</button>
+          </div>
+
+          <div id="legLog" class="log-console">
+            <div class="log-line">&gt; 3 个订单已入账各 100 USDT，当前地址内 BNB 均为 0...</div>
+          </div>
+        </div>
+
+        <!-- RIGHT: VAULTFLOW CREATE2 -->
+        <div class="card" style="border-color: rgba(59, 130, 246, 0.5);">
+          <div class="sandbox-header">
+            <div>
+              <span class="pill pill-deployed">VaultFlow 工业级做法</span>
+              <h3 style="font-size:17px; margin-top:4px;">方案 B：CREATE2 代理保险箱 + 批量归集</h3>
+            </div>
+            <button class="btn" onclick="resetVault()">重置</button>
+          </div>
+
+          <div class="stats-bar">
+            <div class="stat-box">
+              <div class="stat-label">链上交易笔数</div>
+              <div id="vfTxCount" class="stat-val" style="color:var(--green);">0 笔</div>
+            </div>
+            <div class="stat-box">
+              <div class="stat-label">充值地址私钥数</div>
+              <div class="stat-val" style="color:var(--green);">0 把 (纯合约)</div>
+            </div>
+            <div class="stat-box">
+              <div class="stat-label">残留废弃 BNB 粉尘</div>
+              <div class="stat-val" style="color:var(--green);">0 BNB (零垫付)</div>
+            </div>
+          </div>
+
+          <div class="addr-list">
+            <div id="vfItem1" class="addr-item"><span>订单1: 0xVault_1 [未部署]</span><span id="vfA1">100 USDT | 0 BNB</span></div>
+            <div id="vfItem2" class="addr-item"><span>订单2: 0xVault_2 [未部署]</span><span id="vfA2">100 USDT | 0 BNB</span></div>
+            <div id="vfItem3" class="addr-item"><span>订单3: 0xVault_3 [被USDT拉黑!]</span><span id="vfA3">100 USDT | 0 BNB</span></div>
+            <div class="addr-item" style="border-color:var(--green);"><span>公司冷钱包</span><span id="vfCold">0 USDT</span></div>
+          </div>
+
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button id="btnVfSweep" class="btn btn-green" onclick="vaultBatchSweep()">热钱包发 1 笔交易：批量激活 + 归集 (含黑名单容错)</button>
+          </div>
+
+          <div id="vfLog" class="log-console">
+            <div class="log-line">&gt; 3 个预计算地址已收款（注意：故意把订单3设为被 Tether 黑名单冻结，测试容错！）</div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 3 -->
+    <section id="sec3" class="section">
+      <div class="section-header">
+        <span class="step-num">STEP 03</span>
+        <h2>核心黑科技一：为什么 <code>CREATE2</code> 能不连区块链、0 成本算出未来合约地址？</h2>
+      </div>
+      <p class="section-desc">
+        早期以太坊部署合约用 <code>CREATE</code> 指令，地址由 <code>部署者地址 + 部署者当前第几笔交易(Nonce)</code> 决定——根本没法提前给 1 万个订单分配地址，因为你不知道哪个订单先付钱部署！<br/>
+        于是以太坊升级引入了 <strong><code>CREATE2</code></strong>：它把交易序号 <code>Nonce</code> 踢掉了，改成由<strong>四个完全固定已知的参数</strong>做一次哈希运算：
+      </p>
+
+      <div class="card">
+        <div class="calc-grid">
+          <div class="field">
+            <label>1. 选择目标链 (Chain)</label>
+            <select id="calcChain" onchange="updateCreate2()">
+              <option value="42161">Arbitrum One (ChainID: 42161)</option>
+              <option value="56">BNB Smart Chain (ChainID: 56)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>2. 该链上的工厂合约地址 (Factory)</label>
+            <input id="calcFactory" type="text" value="0x7F00a1b2C3d4E5f600000000000000000000FAc7" oninput="updateCreate2()" />
+          </div>
+          <div class="field">
+            <label>3. 商户 ID (Merchant ID)</label>
+            <input id="calcMerchant" type="text" value="mch_steam_store" oninput="updateCreate2()" />
+          </div>
+          <div class="field">
+            <label>4. 订单号 (Order ID — 随便改试试！)</label>
+            <input id="calcOrder" type="text" value="ORD_20261112_0001" oninput="updateCreate2()" />
+          </div>
+        </div>
+
+        <div class="formula-box">
+          <div style="color:var(--text-dim); margin-bottom:6px;">// Go 后端与 Solidity 合约内部完全一致的两步确定性公式：</div>
+          <div><span style="color:var(--purple);">salt</span> = hash( chain_id + merchant_id + order_id ) = <span id="outSalt" style="color:var(--amber);"></span></div>
+          <div style="margin-top:6px;"><span style="color:var(--purple);">充值地址 DepositAddr</span> = hash( <code>0xff</code> + Factory地址 + <span style="color:var(--amber);">salt</span> + 45字节代理代码固定哈希 )[取后20字节]</div>
+          <div style="margin-top:10px; font-size:16px; font-weight:700; color:var(--green);">
+            ===&gt; 推导出的专属收款地址：<span id="outAddr"></span>
+          </div>
+        </div>
+
+        <div style="margin-top:14px; font-size:13.5px; color:var(--text-dim);">
+          <strong>后端视角理解：</strong> 这就相当于一个<strong>纯函数</strong>！Go 后端创建订单时在内存里花 0.01 毫秒算出这个地址入库展示二维码；将来归集时，只要向链上 <code>VaultFactory</code> 传入同一个 <code>salt</code>，EVM 虚拟机就会<strong>分毫不差地在同一个地址上</strong>把保险箱合约创建出来！如果用户没付钱，我们永远不调工厂，链上零垃圾、零花费。
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 4 -->
+    <section id="sec4" class="section">
+      <div class="section-header">
+        <span class="step-num">STEP 04</span>
+        <h2>核心黑科技二：为什么整笔交易由热钱包付 Gas，USDT 却认准是保险箱在转账？</h2>
+      </div>
+      <p class="section-desc">
+        这是理解 EVM 合约最关键的一层窗户纸：<strong>在以太坊/BSC/Arbitrum 一笔嵌套调用里，「谁掏 ETH/BNB 付手续费 (`tx.origin`)」和「当前是谁在说话 (`msg.sender`)」是完全分开的！</strong>
+        点击下方「单步追踪调用链」按钮，看一笔归集交易内部 4 个角色是怎么接力的：
+      </p>
+
+      <div class="card">
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+          <strong>一笔归集交易内部的 EVM 调用栈追踪器</strong>
+          <div style="display:flex; gap:8px;">
+            <button class="btn btn-primary" onclick="nextFlowStep()">下一步调用追踪 &rarr;</button>
+            <button class="btn" onclick="resetFlowStep()">从头开始</button>
+          </div>
+        </div>
+
+        <div class="flow-diagram">
+          <div id="fn0" class="flow-node current">
+            <h4>① Relayer 热钱包 (EOA)</h4>
+            <p>公司后台唯一带私钥的归集触发器，里面只放少量 ETH/BNB 付油钱，不存任何 USDT。</p>
+            <div class="context-badge">
+              角色：<span style="color:var(--amber);">全场唯一掏 Gas 费的人</span>
+            </div>
+          </div>
+
+          <div id="fn1" class="flow-node">
+            <h4>② BatchSweeper (归集总管)</h4>
+            <p>收到热钱包指令，循环遍历 20 个订单：先让工厂在 <code>0xVault</code> 地址铺上 45 字节代理壳，再调 <code>vault.sweep()</code>。</p>
+            <div class="context-badge">
+              此处 <code>msg.sender</code> = 热钱包<br/>
+              校验：必须是合法的热钱包才放行
+            </div>
+          </div>
+
+          <div id="fn2" class="flow-node">
+            <h4>③ 0xVault 代理壳 + DepositVault 模板</h4>
+            <p>45 字节超薄外壳通过 <code>delegatecall</code>（借壳执行）运行模板代码：借模板的逻辑，但<strong>保留 0xVault 自己的门牌号</strong>！</p>
+            <div class="context-badge">
+              此处 <code>msg.sender</code> = BatchSweeper<br/>
+              校验：只有总管能让我吐钱！
+            </div>
+          </div>
+
+          <div id="fn3" class="flow-node">
+            <h4>④ 官方 USDT 合约</h4>
+            <p>收到 <code>transfer(冷钱包, 100U)</code> 请求。它抬头一看：来调我的人正是 <code>0xVault</code> 本尊！立刻把 100U 划给冷钱包！</p>
+            <div class="context-badge">
+              USDT 看到的 <code>msg.sender</code> = <span style="color:var(--green);">0xVault</span><br/>
+              扣谁的 Gas？扣 ① 号热钱包！
+            </div>
+          </div>
+        </div>
+
+        <div id="flowCaption" style="padding:13px 16px; background:var(--bg-code); border-left:3px solid var(--cyan); border-radius:6px; font-size:14px;">
+          <strong>当前停留在第 ① 步：</strong> Go 后端的 <code>TxManager</code> 请求 Rust <code>vault-signer</code> 用热钱包私钥签好一笔交易发上链。这笔交易的矿工费由这个热钱包买单。点击右上角「下一步调用追踪」继续。
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 5 -->
+    <section id="sec5" class="section">
+      <div class="section-header">
+        <span class="step-num">STEP 05</span>
+        <h2>拆开看源码：我们写的 4 个合约到底长什么样？（其实每个核心只有二三十行！）</h2>
+      </div>
+      <p class="section-desc">
+        别被“智能合约工程”吓到，切换下面 4 个标签页看看精简后的核心 Solidity 逻辑——跟写 Go 结构体和接口一样直白：
+      </p>
+
+      <div class="card">
+        <div class="tabs">
+          <button class="tab-btn active" onclick="openTab(0)">1. DepositVault.sol (保险箱模板)</button>
+          <button class="tab-btn" onclick="openTab(1)">2. VaultFactory.sol (CREATE2 工厂)</button>
+          <button class="tab-btn" onclick="openTab(2)">3. BatchSweeper.sol (批量归集总管)</button>
+          <button class="tab-btn" onclick="openTab(3)">4. EIP3009PayRouter.sol (USDC 免Gas收银)</button>
+        </div>
+
+        <!-- TAB 0 -->
+        <div class="tab-panel active">
+          <p style="margin-bottom:12px; color:var(--text-dim);">
+            <strong>职责：</strong> 全场最简单的合约！只部署 1 份在链上当“母版”，所有订单的 45 字节克隆代理都借用它的代码执行。没有 <code>initialize()</code> 函数，天然免疫代理未初始化被黑客抢注漏洞。
+          </p>
+          <pre class="code-block"><span class="c-kw">contract</span> <span class="c-fn">DepositVault</span> {
+    <span class="c-cmt">// immutable 表示部署母版时直接烧死在字节码里，读它不花 Storage Gas！</span>
+    <span class="c-kw">address public immutable</span> SWEEPER;
+
+    <span class="c-kw">constructor</span>(<span class="c-kw">address</span> _sweeper) {
+        SWEEPER = _sweeper;
+    }
+
+    <span class="c-cmt">// 核心归集函数：只有 BatchSweeper 总管能调用！</span>
+    <span class="c-kw">function</span> <span class="c-fn">sweep</span>(<span class="c-kw">address</span> token, <span class="c-kw">address</span> coldWallet, <span class="c-kw">uint256</span> exactAmount) <span class="c-kw">external</span> {
+        <span class="c-kw">require</span>(msg.sender == SWEEPER, <span class="c-str">"Only BatchSweeper allowed"</span>);
+
+        <span class="c-cmt">// 用内联汇编安全调用 token.transfer(coldWallet, exactAmount)：</span>
+        <span class="c-cmt">// 1. 兼容以太坊主网 USDT 不返回 bool 的历史奇葩写法；</span>
+        <span class="c-cmt">// 2. 最多只读取前 32 字节返回数据，防止恶意合约返回几 MB 垃圾数据炸光我们的 Gas (ReturnBomb)。</span>
+        _safeTransferBounded(token, coldWallet, exactAmount);
+    }
+}</pre>
+        </div>
+
+        <!-- TAB 1 -->
+        <div class="tab-panel">
+          <p style="margin-bottom:12px; color:var(--text-dim);">
+            <strong>职责：</strong> ① 提供 <code>predictVaultAddress(salt)</code> 视图函数并与 Go 后端对齐字节码哈希；② 归集时按需在目标地址部署 45 字节的 EIP-1167 最小代理外壳。
+          </p>
+          <pre class="code-block"><span class="c-kw">contract</span> <span class="c-fn">VaultFactory</span> {
+    <span class="c-kw">address public immutable</span> sweeper;
+    <span class="c-kw">address public immutable</span> implementation; <span class="c-cmt">// 指向 DepositVault 母版</span>
+
+    <span class="c-kw">constructor</span>(<span class="c-kw">address</span> relayer, <span class="c-kw">address</span> coldWallet, <span class="c-kw">address</span> timelock) {
+        <span class="c-cmt">// 在一个构造函数里依次创建总管与母版，彻底消除循环地址依赖！</span>
+        sweeper = <span class="c-kw">address</span>(<span class="c-kw">new</span> BatchSweeper(<span class="c-kw">address</span>(<span class="c-kw">this</span>), relayer, coldWallet, timelock));
+        implementation = <span class="c-kw">address</span>(<span class="c-kw">new</span> DepositVault(sweeper));
+    }
+
+    <span class="c-cmt">// 0 Gas 纯计算：预测某个订单 salt 对应的充值地址</span>
+    <span class="c-kw">function</span> <span class="c-fn">predictVaultAddress</span>(<span class="c-kw">bytes32</span> salt) <span class="c-kw">public view returns</span> (<span class="c-kw">address</span>) {
+        <span class="c-kw">return</span> Clones.predictDeterministicAddress(implementation, salt, <span class="c-kw">address</span>(<span class="c-kw">this</span>));
+    }
+
+    <span class="c-cmt">// 归集首次触发时，把 45 字节的最小代理部署到预计算好的地址上</span>
+    <span class="c-kw">function</span> <span class="c-fn">deployProxy</span>(<span class="c-kw">bytes32</span> salt) <span class="c-kw">external returns</span> (<span class="c-kw">address</span>) {
+        <span class="c-kw">return</span> Clones.cloneDeterministic(implementation, salt);
+    }
+}</pre>
+        </div>
+
+        <!-- TAB 2 -->
+        <div class="tab-panel">
+          <p style="margin-bottom:12px; color:var(--text-dim);">
+            <strong>职责：</strong> 一笔交易循环处理最多 50 个充值地址。用两步分离 + <code>try/catch</code> 保证哪怕某一个地址被 Tether 拉黑冻结，其余 49 个地址照常归集进冷钱包！而且支持 48 小时时间锁更换热钱包/冷钱包，完全不影响历史订单地址。
+          </p>
+          <pre class="code-block"><span class="c-kw">contract</span> <span class="c-fn">BatchSweeper</span> {
+    <span class="c-kw">struct</span> SweepItem { <span class="c-kw">bytes32</span> salt; <span class="c-kw">uint256</span> exactAmount; }
+
+    <span class="c-kw">function</span> <span class="c-fn">deployAndSweepBatch</span>(SweepItem[] <span class="c-kw">calldata</span> items, <span class="c-kw">address</span> token, <span class="c-kw">address</span> targetCold) <span class="c-kw">external</span> {
+        <span class="c-kw">require</span>(msg.sender == relayerHotWallet, <span class="c-str">"Only Relayer"</span>);
+        <span class="c-kw">require</span>(targetCold == coldWallet, <span class="c-str">"Must sweep to ColdWallet"</span>);
+
+        <span class="c-kw">for</span> (<span class="c-kw">uint256</span> i = 0; i &lt; items.length; i++) {
+            <span class="c-kw">address</span> vault = factory.predictVaultAddress(items[i].salt);
+
+            <span class="c-cmt">// 第一步：如果这个地址还没部署过代理壳，现在原地部署（二次充值的老地址会自动跳过这步！）</span>
+            <span class="c-kw">if</span> (vault.code.length == 0) {
+                factory.deployProxy(items[i].salt);
+            }
+
+            <span class="c-cmt">// 第二步：限额 120,000 Gas 尝试抽水，加 try/catch 隔离单地址黑名单报错！</span>
+            <span class="c-kw">try</span> IDepositVault(vault).sweep{gas: 120_000}(token, targetCold, items[i].exactAmount) {
+                <span class="c-kw">emit</span> VaultSwept(vault, items[i].salt, token, items[i].exactAmount);
+            } <span class="c-kw">catch</span> {
+                <span class="c-cmt">// 单个地址失败不回滚整笔交易，抛出隔离事件通知 Go 后端标为 is_quarantined</span>
+                <span class="c-kw">emit</span> VaultQuarantined(vault, items[i].salt, token, items[i].exactAmount);
+            }
+        }
+    }
+}</pre>
+        </div>
+
+        <!-- TAB 3 -->
+        <div class="tab-panel">
+          <p style="margin-bottom:12px; color:var(--text-dim);">
+            <strong>职责：</strong> 专门服务于支持 EIP-3009 的原生 USDC（比如 Arbitrum 上的原生 USDC）。用户钱包里没有 ETH 也能付款：用户在网页免费签个名，我们的 Relayer 调这个合约代付几美分 Gas，把用户的 USDC 扣过来直接塞进该订单的 <code>DepositVault</code>，后续跟普通转账走完全同一套扫块入账逻辑！
+          </p>
+          <pre class="code-block"><span class="c-kw">contract</span> <span class="c-fn">EIP3009PayRouter</span> {
+    <span class="c-kw">function</span> <span class="c-fn">payOrderWithAuthorization</span>(
+        <span class="c-kw">bytes32</span> salt, <span class="c-kw">address</span> payer, <span class="c-kw">uint256</span> amount, <span class="c-kw">uint256</span> validBefore,
+        <span class="c-kw">bytes32</span> authNonce, <span class="c-kw">uint8</span> v, <span class="c-kw">bytes32</span> r, <span class="c-kw">bytes32</span> s
+    ) <span class="c-kw">external</span> {
+        <span class="c-cmt">// 合约自己在链上通过工厂算出收款保险箱地址，哪怕后端被黑也无法把用户的钱拐到黑客地址！</span>
+        <span class="c-kw">address</span> vault = vaultFactory.predictVaultAddress(salt);
+        <span class="c-kw">require</span>(authNonce == keccak256(abi.encode(block.chainid, salt)), <span class="c-str">"Invalid nonce"</span>);
+
+        <span class="c-cmt">// 1. 用 receiveWithAuthorization 把用户授权的 USDC 拉进当前路由合约（防路人抢跑）</span>
+        usdc.receiveWithAuthorization(payer, <span class="c-kw">address</span>(<span class="c-kw">this</span>), amount, 0, validBefore, authNonce, v, r, s);
+
+        <span class="c-cmt">// 2. 同一笔交易内，立刻全额转入该订单的专属保险箱 vault，触发标准 Transfer 事件供 Go 扫块入账！</span>
+        SafeERC20.safeTransfer(IERC20(<span class="c-kw">address</span>(usdc)), vault, amount);
+    }
+}</pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- SECTION 6: ARBITRUM VS BSC -->
+    <section id="sec6" class="section">
+      <div class="section-header">
+        <span class="step-num">STEP 06</span>
+        <h2>结合你最常用的 Arbitrum 与 BSC：真实多链开发必考的 4 个差异坑点</h2>
+      </div>
+      <p class="section-desc">
+        你平时自己用 Arbitrum 和 BSC 最多，这简直是面试时的天然优势！很多没真用过链的候选人以为“都是 EVM 链，配置一模一样”，实际上 Arbitrum 和 BSC 的 USDT/USDC 有几个极容易踩爆的真坑，我们的架构已经全部提前兼容了：
+      </p>
+
+      <div class="card" style="padding:0; overflow:hidden;">
+        <table class="compare-table">
+          <thead>
+            <tr>
+              <th style="width:18%;">对比维度</th>
+              <th style="width:41%;">Arbitrum (ETH Layer 2, ChainID: 42161)</th>
+              <th style="width:41%;">BSC 币安智能链 (L1 PoSA, ChainID: 56)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>1. 稳定币小数位精度<br/>(面试头号天坑！)</strong></td>
+              <td>
+                USDT 与原生 USDC 都是 <strong>6 位小数</strong>！<br/>
+                <code>100 USDT = 100,000,000</code>（10<sup>8</sup>）。
+              </td>
+              <td>
+                BSC 上的 Binance-Peg USDT 和 USDC 全是 <strong>18 位小数</strong>！<br/>
+                <code>100 USDT = 100 * 10^18</code>！如果后端写死除以 10<sup>6</sup>，用户充 100U 会被系统算成充了 100 万亿 U！<br/>
+                <span class="pill pill-deployed">我们的解法</span> 数据库存原始整数 <code>NUMERIC(78,0)</code> + <code>supported_assets.decimals</code> 按链配置。
+              </td>
+            </tr>
+            <tr>
+              <td><strong>2. USDC 免 Gas 签名<br/>(EIP-3009 支持度)</strong></td>
+              <td>
+                Circle 官方发行的原生 USDC，<strong>完美支持 EIP-3009</strong>，收银台自动开启「连接钱包 0 ETH 免手续费一键付」。
+              </td>
+              <td>
+                BSC 上的 USDC 是币安跨链桥映射的 BEP-20 合约，<strong>不支持 Circle 原生 EIP-3009</strong>。<br/>
+                <span class="pill pill-deployed">我们的解法</span> <code>supports_eip3009 = false</code>，收银台切到 BSC 时自动隐藏免 Gas 按钮，只展示普通转账。
+              </td>
+            </tr>
+            <tr>
+              <td><strong>3. 出块速度与防分叉<br/>(Reorg 确认策略)</strong></td>
+              <td>
+                约 <strong>0.25 秒出一个软确认块</strong>！如果傻傻只数“12 个块”，才过了 3 秒，Sequencer 未提交回 L1 前并不可靠。<br/>
+                <span class="pill pill-deployed">我们的解法</span> 区分实时检测（秒级提示用户已看到交易）与最终安全高度（<code>safe</code> 标签入账）。
+              </td>
+              <td>
+                Parlia 共识快速终局（Fast Finality），但历史上发生过短分叉重组；通常等待 <strong>15 个区块（约 11~45 秒）或 <code>finalized</code> 标签</strong> 即可安全入账。
+              </td>
+            </tr>
+            <tr>
+              <td><strong>4. 合约层兼容性</strong></td>
+              <td colspan="2">
+                <strong>100% 共用同一套 Solidity 合约！</strong> <code>VaultFactory</code>、<code>DepositVault</code>、<code>BatchSweeper</code> 在 Arbitrum 和 BSC 上一行代码都不用改，分别部署一份即可同时运转。
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- FAQ -->
+    <section class="section">
+      <div class="section-header">
+        <span class="step-num">BONUS</span>
+        <h2>面试官最爱追问的 3 个灵魂拷问（点击展开标准满分答案）</h2>
+      </div>
+
+      <div class="qa-item open">
+        <button class="qa-q" onclick="toggleQa(this)">
+          <span>Q1：用户已经往 0xVault 转过一次钱并且归集部署过代理了，如果他手滑又往这个老地址转了第二笔钱，怎么办？</span>
+          <span>&#9662;</span>
+        </button>
+        <div class="qa-a">
+          完全没问题！第一次归集时 <code>vault.code.length == 0</code>，所以 <code>BatchSweeper</code> 先调工厂部署了那 45 字节的代理外壳并转走了第一笔钱；等他转入第二笔钱时，那个 45 字节代理外壳<strong>一直都在原地没销毁</strong>！下一次归集批次扫到它时，判断 <code>vault.code.length &gt; 0</code> 直接跳过部署步骤（省下 4.2 万部署 Gas），直接调 <code>sweep()</code> 把第二笔钱抽进冷钱包即可，支持无限次重复归集。
+        </div>
+      </div>
+
+      <div class="qa-item">
+        <button class="qa-q" onclick="toggleQa(this)">
+          <span>Q2：如果黑客也在链上抢先调用我们的 VaultFactory，提前把某个订单的代理合约部署出来，能偷走钱吗？</span>
+          <span>&#9662;</span>
+        </button>
+        <div class="qa-a">
+          1 分钱都偷不走，反而等于免费帮我们出了部署 Gas 费！因为 <code>DepositVault</code> 没有 <code>initialize()</code> 初始化函数，它唯一认准的 <code>SWEEPER</code> 地址在母版合约部署那一刻就已经作为 <code>immutable</code> 常量焊死在字节码里了。黑客就算帮我们把代理外壳提前建好，里面的权限依然锁死只有我们的 <code>BatchSweeper</code> 能调，而且收款目标锁死只能去公司的冷钱包。
+        </div>
+      </div>
+
+      <div class="qa-item">
+        <button class="qa-q" onclick="toggleQa(this)">
+          <span>Q3：万一我们公司的归集热钱包私钥泄露了，或者冷钱包硬件要换新地址，之前派发出去的几万个充值地址岂不是全废了？</span>
+          <span>&#9662;</span>
+        </button>
+        <div class="qa-a">
+          完全不会废！这是我们在架构里专门做的解耦设计：<code>CREATE2</code> 地址公式只依赖 <code>VaultFactory</code> 和 <code>DepositVault</code> 的字节码，而 <code>DepositVault</code> 里只存了不可变的 <code>BatchSweeper</code> 合约地址；真正的热钱包地址和冷钱包地址是存在 <code>BatchSweeper</code> 里的状态变量（受 48 小时多签时间锁保护）。所以更换热钱包或冷钱包时，不需要重新部署工厂和模板，<code>init_code_hash</code> 纹丝不动，所有历史与未来充值地址 100% 继续有效！
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <script>
+    // --- Section 1 Interactive ERC20 Table ---
+    function simErc20Transfer() {
+      document.getElementById('balUser').textContent = '400.00 USDT';
+      document.getElementById('balVault').innerHTML = '<strong style="color:#34d399;">100.00 USDT (已安全记账！)</strong>';
+      const row = document.getElementById('rowVault');
+      row.classList.remove('highlight-row');
+      void row.offsetWidth;
+      row.classList.add('highlight-row');
+      document.getElementById('btnSimTransfer').disabled = true;
+      document.getElementById('btnSimDeploySweep').disabled = false;
+      document.getElementById('sec1Explain').innerHTML =
+        '<strong style="color:#34d399;">看明白了吗！</strong> 用户转账只是去修改了<strong>「USDT 官方合约」</strong>内部数据库里的一行数字（把 0xAlice 减 100，把 0x8888 加 100）。哪怕 <code>0x8888...beef</code> 此时在链上连一行代码都没有、也没有私钥，这 100 USDT 也稳稳记在它的名下，谁都动不了！现在点击按钮「2. 稍后部署合约并转入冷钱包」。';
+    }
+
+    function simDeployAndSweep() {
+      document.getElementById('vaultState').innerHTML = '<span class="pill pill-deployed">已原地部署 45字节代理保险箱</span>';
+      document.getElementById('balVault').textContent = '0.00 USDT';
+      document.getElementById('balCold').innerHTML = '<strong style="color:#34d399;">10,100.00 USDT (+100U 到账！)</strong>';
+      const row = document.getElementById('rowCold');
+      row.classList.remove('highlight-row');
+      void row.offsetWidth;
+      row.classList.add('highlight-row');
+      document.getElementById('btnSimDeploySweep').disabled = true;
+      document.getElementById('sec1Explain').innerHTML =
+        '<strong style="color:#60a5fa;">完美闭环！</strong> 公司热钱包发出一笔归集交易：先在 <code>0x8888...beef</code> 原地放上保险箱代码，紧接着同一笔交易内以 <code>0x8888...beef</code> 的身份通知 USDT 合约把 100U 划给冷钱包。注意看第三列：<strong>0x8888 全程 ETH 余额都是 0.00，一分钱油钱都没垫付！</strong>';
+    }
+
+    function resetSec1() {
+      document.getElementById('balUser').textContent = '500.00 USDT';
+      document.getElementById('balVault').textContent = '0.00 USDT';
+      document.getElementById('balCold').textContent = '10,000.00 USDT';
+      document.getElementById('vaultState').innerHTML = '<span class="pill pill-empty">空地址 (0 字节代码，无私钥！)</span>';
+      document.getElementById('btnSimTransfer').disabled = false;
+      document.getElementById('btnSimDeploySweep').disabled = true;
+      document.getElementById('sec1Explain').textContent = '点击上方按钮「1. 用户向空地址 0x8888 转 100 USDT」看看会发生什么。';
+    }
+
+    // --- Section 2 Left: Legacy EOA ---
+    function appendLog(id, html) {
+      const box = document.getElementById(id);
+      const div = document.createElement('div');
+      div.className = 'log-line';
+      div.innerHTML = html;
+      box.appendChild(div);
+      box.scrollTop = box.scrollHeight;
+    }
+
+    function legacyTryDirect() {
+      appendLog('legLog', '<span class="log-err">[报错 Revert] 0xEOA_1 尝试转出 USDT 失败：地址内 BNB 余额为 0，付不起矿工费！</span>');
+    }
+
+    function legacySendGas() {
+      document.getElementById('legTxCount').textContent = '3 笔';
+      document.getElementById('legA1').textContent = '100 USDT | 0.0005 BNB';
+      document.getElementById('legA2').textContent = '100 USDT | 0.0005 BNB';
+      document.getElementById('legA3').textContent = '100 USDT | 0.0005 BNB';
+      document.getElementById('btnLegGas').disabled = true;
+      document.getElementById('btnLegSweep').disabled = false;
+      appendLog('legLog', '<span class="log-warn">[Tx #1~#3] 热钱包向 3 个充值地址各打入 0.0005 BNB 垫付油钱，等待区块确认...</span>');
+    }
+
+    function legacySweep() {
+      document.getElementById('legTxCount').innerHTML = '<span style="color:var(--red);">6 笔 (翻倍!)</span>';
+      document.getElementById('legDust').innerHTML = '<span style="color:var(--amber);">0.00066 BNB (死钱)</span>';
+      document.getElementById('legA1').textContent = '0 USDT | 残留 0.00022 BNB';
+      document.getElementById('legA2').textContent = '0 USDT | 残留 0.00022 BNB';
+      document.getElementById('legA3').textContent = '0 USDT | 残留 0.00022 BNB';
+      document.getElementById('legCold').innerHTML = '<strong style="color:#34d399;">300 USDT</strong>';
+      document.getElementById('btnLegSweep').disabled = true;
+      appendLog('legLog', '<span class="log-ok">[Tx #4~#6] 服务器从内存加载 3 把用户私钥分别签名归集完成。但每个地址都剩下了转不干净的 BNB 粉尘！</span>');
+    }
+
+    function resetLegacy() {
+      document.getElementById('legTxCount').textContent = '0 笔';
+      document.getElementById('legDust').textContent = '0 BNB';
+      document.getElementById('legA1').textContent = '100 USDT | 0 BNB';
+      document.getElementById('legA2').textContent = '100 USDT | 0 BNB';
+      document.getElementById('legA3').textContent = '100 USDT | 0 BNB';
+      document.getElementById('legCold').textContent = '0 USDT';
+      document.getElementById('btnLegGas').disabled = false;
+      document.getElementById('btnLegSweep').disabled = true;
+      document.getElementById('legLog').innerHTML = '<div class="log-line">&gt; 3 个订单已入账各 100 USDT，当前地址内 BNB 均为 0...</div>';
+    }
+
+    // --- Section 2 Right: VaultFlow ---
+    function vaultBatchSweep() {
+      document.getElementById('vfTxCount').textContent = '仅 1 笔!';
+      document.getElementById('vfItem1').innerHTML = '<span>订单1: 0xVault_1 <span class="pill pill-deployed">已激活归集</span></span><span>0 USDT | 0 BNB</span>';
+      document.getElementById('vfItem2').innerHTML = '<span>订单2: 0xVault_2 <span class="pill pill-deployed">已激活归集</span></span><span>0 USDT | 0 BNB</span>';
+      document.getElementById('vfItem3').innerHTML = '<span>订单3: 0xVault_3 <span class="pill pill-warn">已隔离跳过</span></span><span>100 USDT (黑名单冻结)</span>';
+      document.getElementById('vfCold').innerHTML = '<strong style="color:#34d399;">200 USDT (正常地址秒到账)</strong>';
+      document.getElementById('btnVfSweep').disabled = true;
+      appendLog('vfLog', '<span class="log-ok">[单笔原子交易 Tx #1] Relayer 调用 BatchSweeper.deployAndSweepBatch：</span>');
+      appendLog('vfLog', '<span class="log-ok">  ├─ 0xVault_1: CREATE2 部署 45B 代理 -&gt; 划转 100 USDT 至冷钱包 [成功]</span>');
+      appendLog('vfLog', '<span class="log-ok">  ├─ 0xVault_2: CREATE2 部署 45B 代理 -&gt; 划转 100 USDT 至冷钱包 [成功]</span>');
+      appendLog('vfLog', '<span class="log-warn">  └─ 0xVault_3: 触发 USDT 黑名单 Revert -&gt; try/catch 精准捕获并标记 QUARANTINED，不拖累前两笔！</span>');
+    }
+
+    function resetVault() {
+      document.getElementById('vfTxCount').textContent = '0 笔';
+      document.getElementById('vfItem1').innerHTML = '<span>订单1: 0xVault_1 [未部署]</span><span id="vfA1">100 USDT | 0 BNB</span>';
+      document.getElementById('vfItem2').innerHTML = '<span>订单2: 0xVault_2 [未部署]</span><span id="vfA2">100 USDT | 0 BNB</span>';
+      document.getElementById('vfItem3').innerHTML = '<span>订单3: 0xVault_3 [被USDT拉黑!]</span><span id="vfA3">100 USDT | 0 BNB</span>';
+      document.getElementById('vfCold').textContent = '0 USDT';
+      document.getElementById('btnVfSweep').disabled = false;
+      document.getElementById('vfLog').innerHTML = '<div class="log-line">&gt; 3 个预计算地址已收款（注意：故意把订单3设为被 Tether 黑名单冻结，测试容错！）</div>';
+    }
+
+    // --- Section 3 Deterministic Hash Demo (FNV-based visual deterministic hex for offline demo) ---
+    function pseudoKeccakHex(input, len) {
+      let h1 = 0xdeadbeef ^ input.length, h2 = 0x41c6ce57 ^ input.length;
+      let out = '';
+      for (let round = 0; out.length < len; round++) {
+        const str = input + ':' + round;
+        for (let i = 0; i < str.length; i++) {
+          const ch = str.charCodeAt(i);
+          h1 = Math.imul(h1 ^ ch, 2654435761);
+          h2 = Math.imul(h2 ^ ch, 1597334677);
+        }
+        h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+        h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+        out += (h1 >>> 0).toString(16).padStart(8, '0') + (h2 >>> 0).toString(16).padStart(8, '0');
+      }
+      return out.slice(0, len);
+    }
+
+    function updateCreate2() {
+      const chain = document.getElementById('calcChain').value;
+      const factory = document.getElementById('calcFactory').value.trim();
+      const mch = document.getElementById('calcMerchant').value.trim();
+      const ord = document.getElementById('calcOrder').value.trim();
+      const salt = '0x' + pseudoKeccakHex(chain + '|' + mch + '|' + ord, 64);
+      const addr = '0x' + pseudoKeccakHex('0xff|' + factory.toLowerCase() + '|' + salt + '|eip1167_init_code', 40);
+      document.getElementById('outSalt').textContent = salt;
+      document.getElementById('outAddr').textContent = addr;
+    }
+    updateCreate2();
+
+    // --- Section 4 Call Stack Stepper ---
+    let flowIdx = 0;
+    const flowTexts = [
+      '<strong>当前停留在第 ① 步：</strong> Go 后端的 <code>TxManager</code> 请求 Rust <code>vault-signer</code> 用热钱包私钥签好一笔交易发上链。这笔交易的矿工费由这个热钱包买单。',
+      '<strong>当前停留在第 ② 步：</strong> 交易进入 <code>BatchSweeper</code> 总管合约。总管检查调用者确实是自家的热钱包、且收款目标是写死的冷钱包后，让工厂把 45 字节代理壳部署到 <code>0xVault</code>，随后调用 <code>0xVault.sweep()</code>。',
+      '<strong>当前停留在第 ③ 步（最关键的借壳魔法）：</strong> <code>0xVault</code> 自身只有 45 字节，它用 EVM 的 <code>delegatecall</code> 指令去借用 <code>DepositVault</code> 模板里的 <code>sweep</code> 代码执行。重点：<code>delegatecall</code> 会保持当前上下文身份仍然是 <code>0xVault</code>！',
+      '<strong>当前停留在第 ④ 步（大功告成）：</strong> 借来的代码向官方 USDT 合约发起 <code>transfer(冷钱包, 100U)</code>。在 USDT 合约眼里，<code>msg.sender</code> 就是 <code>0xVault</code> 本人，验证通过直接划款！而整趟调用链消耗的 Gas 费，自动从第 ① 步的热钱包里一次性扣除！'
+    ];
+
+    function renderFlow() {
+      for (let i = 0; i < 4; i++) {
+        document.getElementById('fn' + i).classList.toggle('current', i === flowIdx);
+      }
+      document.getElementById('flowCaption').innerHTML = flowTexts[flowIdx];
+    }
+    function nextFlowStep() { flowIdx = (flowIdx + 1) % 4; renderFlow(); }
+    function resetFlowStep() { flowIdx = 0; renderFlow(); }
+
+    // --- Section 5 Code Tabs ---
+    function openTab(idx) {
+      document.querySelectorAll('.tab-btn').forEach((b, i) => b.classList.toggle('active', i === idx));
+      document.querySelectorAll('.tab-panel').forEach((p, i) => p.classList.toggle('active', i === idx));
+    }
+
+    // --- Bonus FAQ ---
+    function toggleQa(btn) {
+      btn.parentElement.classList.toggle('open');
+    }
+  </script>
+</body>
+</html>

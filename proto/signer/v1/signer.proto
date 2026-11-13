@@ -1,0 +1,192 @@
+syntax = "proto3";
+
+package signer.v1;
+
+option go_package = "vaultflow/gateway-core/internal/genproto/signerv1";
+
+// ---------------------------------------------------------------------------
+// VaultSignerService — 进程级隔离签名金库 (vault-signer, Rust/tonic)。
+//
+// 零信任原则: signer 绝不信任请求体中的任何明文业务元数据。
+// 所有签名校验均基于本地独立解码的 EIP-2718 Type-2 未签名交易字节、
+// 本地 SQLite 白名单/幂等槽/限额状态、以及离线管理员 Ed25519 自证载荷。
+// 传输层强制双向 mTLS (离线根 CA 签发, 90 天滚动轮换)。
+// ---------------------------------------------------------------------------
+service VaultSignerService {
+  // 注册商户提现白名单地址 (附带租期)。
+  // signed_payload 为 69B Ed25519 载荷 (见 Rejection/文档约定):
+  //   "VAULTFLOW_ADDR_V1"(17B) || chain_id u64BE(8) || merchant_uuid(16)
+  //   || recipient_address(20) || valid_until_unix u64BE(8)
+  rpc RegisterWithdrawalAddress(RegisterWithdrawalAddressRequest)
+      returns (RegisterWithdrawalAddressResponse);
+
+  // 紧急吊销提现白名单地址。供管理员经 mTLS 直连调用;
+  // 只影响可用性不触及资金, 故不强制 Ed25519 自证, 但全程落审计链。
+  rpc RevokeWithdrawalAddress(RevokeWithdrawalAddressRequest)
+      returns (RevokeWithdrawalAddressResponse);
+
+  // 请求签名一笔出站交易。signer 本地解码 unsigned_tx, 推导其归属策略
+  // (SWEEP / EIP3009_RELAY / PAYOUT / GAP_FILLER) 并执行对应防火墙校验;
+  // 命中双字段同 Nonce 幂等槽规则的 RBF / Dropped 补发 / Filler 取消
+  // 不重复扣减 24h 滑动限额。
+  rpc SignTransaction(SignTransactionRequest) returns (SignTransactionResponse);
+
+  // 从创世记录逐条重算 SHA-256 审计哈希链。
+  // entry_hash = SHA256(seq || timestamp || action || request_digest
+  //                     || decision || reason || prev_hash)
+  rpc VerifyAuditChain(VerifyAuditChainRequest)
+      returns (VerifyAuditChainResponse);
+
+  // 健康度与运行态巡检 (版本 / 时钟 / 白名单规模 / 审计链 tip)。
+  rpc GetSignerHealth(GetSignerHealthRequest)
+      returns (GetSignerHealthResponse);
+}
+
+// ---------------------------------------------------------------------------
+// 枚举
+// ---------------------------------------------------------------------------
+
+// 拒签原因码 — 与审计日志一并落盘, 供 gateway-core 与运维精确定位。
+enum RejectCode {
+  REJECT_CODE_UNSPECIFIED = 0;
+  MALFORMED_TX = 1;            // EIP-2718 Type-2 RLP 解码失败
+  UNKNOWN_POLICY = 2;          // 不匹配四类策略中任何一类
+  POLICY_VIOLATION = 3;        // 命中策略但字段校验失败 (通用)
+  COLD_WALLET_NOT_ALLOWED = 4; // deployAndSweepBatch 目标冷金库不在只读白名单
+  AUTH_NONCE_MISMATCH = 5;     // EIP-3009 authNonce != keccak256(chain_id, salt)
+  WHITELIST_NOT_FOUND = 6;     // 提现收款人未注册
+  WHITELIST_COOLDOWN = 7;      // 未满 first_seen_at + cooldown (默认 24h)
+  WHITELIST_EXPIRED = 8;       // now >= valid_until 租期过期
+  WHITELIST_REVOKED = 9;       // 已吊销
+  INVALID_ADMIN_SIGNATURE = 10; // Ed25519 载荷验签失败
+  INVALID_REFUND_TICKET = 11;   // RefundTicket 字段不匹配 / 过期 / 验签失败
+  NONCE_SLOT_CONFLICT = 12;     // 同 Nonce 槽位发现 (token,recipient,amount) 篡改
+  DAILY_LIMIT_EXCEEDED = 13;    // 触发 24h 滑动限额熔断器
+  INTERNAL = 14;
+}
+
+// 四类交易策略。请求侧仅作 hint; signer 始终以自行解码结论为准。
+enum TxPolicy {
+  TX_POLICY_UNSPECIFIED = 0;
+  SWEEP = 1;         // relayer -> BatchSweeper.deployAndSweepBatch
+  EIP3009_RELAY = 2; // relayer -> EIP3009PayRouter.payOrderWithAuthorization
+  PAYOUT = 3;        // payout wallet -> 白名单稳定币 transfer
+  GAP_FILLER = 4;    // 热钱包 0 ETH 自转账 (取消/填洞)
+}
+
+// ---------------------------------------------------------------------------
+// RegisterWithdrawalAddress
+// ---------------------------------------------------------------------------
+
+message RegisterWithdrawalAddressRequest {
+  // 69B 大端定长载荷: "VAULTFLOW_ADDR_V1"(17B) || chain_id u64BE(8)
+  // || merchant_uuid(16B) || recipient_address(20B) || valid_until_unix u64BE(8)
+  bytes signed_payload = 1;
+  // 离线管理员 Ed25519 签名 (64B), 公钥为 signer 配置的 admin_approver_pubkey
+  bytes admin_signature = 2;
+}
+
+message RegisterWithdrawalAddressResponse {
+  bool accepted = 1;
+  RejectCode reject_code = 2;
+  string reason = 3;
+  uint64 audit_seq = 4;
+}
+
+// ---------------------------------------------------------------------------
+// RevokeWithdrawalAddress
+// ---------------------------------------------------------------------------
+
+message RevokeWithdrawalAddressRequest {
+  uint64 chain_id = 1;
+  bytes merchant_uuid = 2;      // 16B
+  bytes recipient_address = 3;  // 20B
+  string admin_note = 4;        // 吊销原因备注, 原样写入审计日志
+}
+
+message RevokeWithdrawalAddressResponse {
+  bool accepted = 1;
+  RejectCode reject_code = 2;
+  string reason = 3;
+  uint64 audit_seq = 4;
+}
+
+// ---------------------------------------------------------------------------
+// SignTransaction
+// ---------------------------------------------------------------------------
+
+// 客户异常退款票据:
+// signed_payload 为 127B 载荷:
+//   "VAULTFLOW_REFUND_V1"(19B) || chain_id u64BE(8) || token_address(20)
+//   || to_address(20) || exact_amount_u256(32B BE) || payout_uuid(16)
+//   || retry_seq u32BE(4) || expiry_unix u64BE(8)
+message RefundTicket {
+  bytes signed_payload = 1;   // 127B
+  bytes admin_signature = 2;  // Ed25519 64B
+}
+
+message SignTransactionRequest {
+  uint64 chain_id = 1;
+  // EIP-2718 Type-2 (EIP-1559) 未签名原始字节:
+  // 0x02 || rlp([chainId, nonce, maxPriorityFeePerGas, maxFeePerGas,
+  //              gasLimit, to, value, data, accessList])
+  bytes unsigned_tx = 2;
+  // 调用方策略提示 (可省); signer 始终自行推导, 不一致时拒签。
+  TxPolicy policy_hint = 3;
+  // PAYOUT 策略必填: 幂等槽绑定的业务单号与重试序号。
+  bytes payout_uuid = 4;  // 16B UUID
+  uint32 retry_seq = 5;
+  // 客户异常退款时携带 (商户常规提现为空)。
+  RefundTicket refund_ticket = 6;
+}
+
+message SignedTx {
+  bytes raw_tx = 1;    // 签名后 EIP-2718 Type-2 字节, 可直接广播
+  bytes tx_hash = 2;   // keccak256(raw_tx), 32B
+  uint64 audit_seq = 3;
+}
+
+message Rejection {
+  RejectCode code = 1;
+  string reason = 2;
+  uint64 audit_seq = 3;
+}
+
+message SignTransactionResponse {
+  oneof result {
+    SignedTx signed = 1;
+    Rejection rejected = 2;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// VerifyAuditChain
+// ---------------------------------------------------------------------------
+
+message VerifyAuditChainRequest {
+  uint64 from_seq = 1; // 0 表示从创世记录开始
+  uint64 to_seq = 2;   // 0 表示校验到最新
+}
+
+message VerifyAuditChainResponse {
+  bool valid = 1;
+  uint64 entries_checked = 2;
+  uint64 first_bad_seq = 3; // valid=false 时定位第一条哈希不连续的记录
+  bytes tip_hash = 4;       // 校验末端的链头哈希 (32B)
+}
+
+// ---------------------------------------------------------------------------
+// GetSignerHealth
+// ---------------------------------------------------------------------------
+
+message GetSignerHealthRequest {}
+
+message GetSignerHealthResponse {
+  string version = 1;
+  uint64 uptime_seconds = 2;
+  int64 signer_clock_unix = 3;        // signer 本地时钟 (白名单冷却判定基准)
+  uint32 whitelist_entries = 4;       // 白名单条目数
+  uint64 audit_entries = 5;           // 审计日志总数
+  bytes audit_tip_hash = 6;           // 当前哈希链 tip (32B)
+  repeated string loaded_wallets = 7; // 已加载热钱包地址 (0x...)
+}

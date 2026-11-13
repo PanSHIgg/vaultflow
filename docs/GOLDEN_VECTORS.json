@@ -1,0 +1,56 @@
+{
+  "spec_version": 1,
+  "eip1167": {
+    "init_code_template": "0x3d602d80600a3d3981f3363d3d373d3d3d363d73{implementation}5af43d82803e903d91602b57fd5bf3",
+    "runtime_bytes": 45,
+    "creation_bytes": 55
+  },
+  "canonical_addresses": {
+    "implementation": "0x1111111111111111111111111111111111111111",
+    "factory": "0x2222222222222222222222222222222222222222"
+  },
+  "vectors": [
+    {
+      "name": "chain_id_31337",
+      "chain_id": 31337,
+      "merchant_id": "0x00112233445566778899aabbccddeeff",
+      "order_id": "0xffeeddccbbaa99887766554433221100",
+      "salt": "0x55b28547100539cc5b92b67e6265adcc0b81e207dcb758222285a14b58e16834",
+      "auth_nonce": "0x3337d78303e32c3481fbe13adfa72942f14970c28e974855c2023a9cee9ac225",
+      "init_code": "0x3d602d80600a3d3981f3363d3d373d3d3d363d7311111111111111111111111111111111111111115af43d82803e903d91602b57fd5bf3",
+      "init_code_hash": "0xa2d88143eeea48efcc9f4a249ebe53d688d02897963ffc34032b89239ec11b5e",
+      "vault_address": "0x7fc0911310dd4b4d5cc547658724b58857e11557"
+    },
+    {
+      "name": "chain_id_1",
+      "chain_id": 1,
+      "merchant_id": "0x00112233445566778899aabbccddeeff",
+      "order_id": "0xffeeddccbbaa99887766554433221100",
+      "salt": "0xdc1ab224505a934e3d9842da897a6b7ecccba22c1f4cb202ad5bba11ddac8ffc",
+      "auth_nonce": "0xcbfd98f6edc05b6afe4ee597131f9a7c61c114b8aee79e0bee1008b93ef4616f",
+      "init_code": "0x3d602d80600a3d3981f3363d3d373d3d3d363d7311111111111111111111111111111111111111115af43d82803e903d91602b57fd5bf3",
+      "init_code_hash": "0xa2d88143eeea48efcc9f4a249ebe53d688d02897963ffc34032b89239ec11b5e",
+      "vault_address": "0x882a2cc3347084ebf9bbaf9b7cf45eaa0b0a01e8"
+    }
+  ],
+  "ed25519_admin": {
+    "private_seed_hex": "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    "public_key_hex": "0x79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+    "addr_v1": {
+      "description": "Withdrawal whitelist lease approval: 'VAULTFLOW_ADDR_V1'(17B ASCII) || chain_id u64BE || merchant_uuid raw16 || recipient bytes20 || valid_until u64BE",
+      "payload_hex": "0x5641554c54464c4f575f414444525f56310000000000007a6900112233445566778899aabbccddeeff33333333333333333333333333333333333333330000000070dbd880",
+      "payload_bytes": 69,
+      "signature_hex": "0x804a83e46c4d22b4045463d578b505c0474f01950062537b4e7462a321a384e5b49b4e026e8ef3215e6ff8c7ae4bd641ce3c51dbbb2ea252713abc4f5998bf02"
+    },
+    "refund_v1": {
+      "description": "Customer refund ticket: 'VAULTFLOW_REFUND_V1'(19B ASCII) || chain_id u64BE || token bytes20 || to bytes20 || exact_amount u256BE || payout_uuid raw16 || retry_seq u32BE || expiry u64BE",
+      "payload_hex": "0x5641554c54464c4f575f524546554e445f56310000000000007a6944444444444444444444444444444444444444445555555555555555555555555555555555555555000000000000000000000000000000000000000000000000000000000016e360ffeeddccbbaa99887766554433221100000000000000000070dbd880",
+      "payload_bytes": 127,
+      "signature_hex": "0x3f07be8703bdc1842b1ab083785f8457b1185e92814993b697b10c92e1bfa0fe01554bcaf957420c67b37e1d4f080a58a20b9835ad321e9117e9b885089d2205"
+    }
+  },
+  "eip2718_unsigned_tx_example": {
+    "description": "EIP-2718 Type-2 (EIP-1559) unsigned tx = 0x02 || rlp([chainId,nonce,maxPriorityFeePerGas,maxFeePerGas,gasLimit,to,value,data,accessList]); example: chainId=31337, nonce=0, tip=1gwei, maxFee=2gwei, gasLimit=21000, to=0x3333...3333, value=0, data=0x, accessList=[] (GAP_FILLER-style self-transfer template)",
+    "hex": "0x02e9827a6980843b9aca0084773594008252089433333333333333333333333333333333333333338080c0"
+  }
+}

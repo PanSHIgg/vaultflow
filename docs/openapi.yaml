@@ -1,0 +1,2213 @@
+openapi: 3.1.0
+info:
+  title: VaultFlow gateway-core REST API
+  version: 0.1.0
+  description: |
+    **VaultFlow — 多链稳定币支付与托管清结算系统 / Multi-chain stablecoin payment & custodial settlement gateway.**
+
+    Contract-freeze deliverable **P0-5** (`docs/openapi.yaml`) for `gateway-core` (Go modular monolith).
+    This document is the single source of truth for the REST surface consumed by the
+    Hosted Checkout cashier (W6, `web/src/app/pay/[orderId]`), the merchant & ops console
+    (W6, `web/src/app/dashboard`) and implemented by the API/SSE/sim layer (W5,
+    `gateway-core/internal/{api,sse,sim}`).
+
+    ## Global conventions (frozen)
+
+    - **Amounts**: every `NUMERIC(78,0)` value (token atomic units, gas prices, native wei)
+      serializes as a **decimal string** matching `^(0|[1-9][0-9]{0,77})$` — see `Amount`.
+      Never use JSON numbers for amounts.
+    - **Idempotency**: every non-GET endpoint requires an `Idempotency-Key` header
+      (see `IdempotencyKey`). The gateway stores `(scope, idempotency_key) -> request_hash`;
+      same key + same body SHA-256 replays the first response, same key + different body
+      returns `409 IDEMPOTENCY_CONFLICT`.
+    - **Pagination**: list endpoints use opaque cursor pagination
+      (`cursor`, `limit`, response `page.next_cursor` / `page.has_more`).
+    - **Errors**: all non-2xx responses use the `Error` envelope
+      `{ "error": { "code", "message", "details? } }`; `code` is a stable `ErrorCode` enum.
+    - **Auth**: merchant endpoints use `X-Api-Key`; admin & simulator endpoints use
+      `Authorization: Bearer <JWT>`; `/v1/public/**` is unauthenticated.
+    - **Timestamps**: RFC 3339 / ISO 8601 UTC (`date-time`) unless a field is explicitly
+      named `*_unix` (then it is a `uint64` Unix epoch integer).
+    - **UUIDs**: system-level ledger accounts are owned by the zero sentinel UUID
+      `00000000-0000-0000-0000-000000000000`.
+    - **State machines**: all status enums mirror ARCHITECTURE.md §5.1–5.4 and the
+      `CHECK` constraints frozen in `migrations/001_init.sql` exactly.
+    - **Ed25519 payloads** (per `docs/GOLDEN_VECTORS.json`, big-endian fixed-width binary):
+      - 69-byte whitelist lease: `"VAULTFLOW_ADDR_V1"(17B) || chain_id(8B BE) || merchant_uuid(16B) || recipient_address(20B) || valid_until_unix(8B BE)`
+      - 127-byte refund ticket: `"VAULTFLOW_REFUND_V1"(19B) || chain_id(8B BE) || token_address(20B) || to_address(20B) || exact_amount_u256(32B BE) || payout_uuid(16B) || retry_seq(4B BE) || expiry_unix(8B BE)`
+      Clients send the individual fields plus the raw 64-byte signature as hex; the gateway
+      reassembles the canonical binary payload before forwarding to `vault-signer`.
+  contact:
+    name: VaultFlow engineering
+  license:
+    name: Proprietary
+  x-contract: P0-5
+  x-architecture-version: "5"
+
+servers:
+  - url: http://localhost:8080
+    description: Local docker-compose / Anvil development stack
+  - url: /
+    description: Same-origin (production / preview deployments)
+
+tags:
+  - name: merchant-orders
+    description: Merchant payment order lifecycle (API key auth).
+  - name: merchant-payouts
+    description: Merchant withdrawals & customer refunds (API key auth).
+  - name: merchant-withdrawal-addresses
+    description: Ed25519-leased withdrawal whitelist management (API key auth).
+  - name: merchant-ledger
+    description: Double-entry ledger introspection (API key auth).
+  - name: public-cashier
+    description: Unauthenticated hosted-checkout endpoints.
+  - name: admin-ops
+    description: Operations, reconciliation & security monitoring (JWT auth).
+  - name: dev-simulator
+    description: |
+      Deterministic adversarial-drill controller. Mounted **only** when the server is
+      started with `ENABLE_DEV_SIMULATOR=true`; all operations return
+      `404 FEATURE_DISABLED`/`403` otherwise. Every operation is flagged `x-dev-only: true`
+      and MUST NOT be relied upon by production clients.
+
+paths:
+  # ==========================================================================
+  # 1. MERCHANT — PAYMENT ORDERS (X-Api-Key)
+  # ==========================================================================
+  /v1/orders:
+    post:
+      tags: [merchant-orders]
+      operationId: createOrder
+      summary: Create a payment order (idempotent)
+      description: |
+        Atomically creates a `payment_orders` row (`AWAITING_PAYMENT`) bound 1:1 to a
+        `deposit_addresses` row. The deposit address is the deterministic CREATE2 vault
+        derived from `salt = keccak256(abi.encode(uint256(chainId), bytes16(merchantId),
+        bytes16(orderId)))` — it is never reused across orders.
+
+        Idempotent by `(merchant_id, Idempotency-Key)`: replaying the same key with an
+        identical body returns the original order (`201` with the original payload).
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Order created (or idempotent replay of the original creation).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    get:
+      tags: [merchant-orders]
+      operationId: listOrders
+      summary: List payment orders (merchant view)
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          description: Filter by one or more order states (repeatable / comma-separated).
+          required: false
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/PaymentOrderStatus' }
+          style: form
+          explode: true
+        - name: chain_id
+          in: query
+          required: false
+          schema: { type: integer, format: int64 }
+        - name: asset_symbol
+          in: query
+          required: false
+          schema: { type: string, example: USDC }
+        - name: merchant_order_ref
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Page of orders, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderPage'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/orders/{orderId}:
+    get:
+      tags: [merchant-orders]
+      operationId: getOrder
+      summary: Get a single payment order (merchant view)
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: The order.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/orders/{orderId}/review:
+    post:
+      tags: [merchant-orders]
+      operationId: reviewOrder
+      summary: Manual review decision on a suspended order
+      description: |
+        Resolves an order parked in a human-review state (ARCHITECTURE §5.2):
+
+        | `action` | Allowed from | Transition | Ledger effect |
+        |---|---|---|---|
+        | `ACCEPT_UNDERPAID_DISCOUNT` | `UNDERPAID_EXPIRED_REVIEW` | `-> PAID` | template 4 `ORDER_SETTLE`: DR `SUSPENSE_REFUNDABLE_LIAB` / CR `MERCHANT_AVAILABLE` + `FEE_REVENUE` on the received amount |
+        | `ACCEPT_LATE_PAYMENT` | `LATE_PAID_REVIEW` | `-> PAID` | same template 4 on the received amount |
+        | `APPROVE_REFUND` | `UNDERPAID_EXPIRED_REVIEW`, `LATE_PAID_REVIEW` | `-> REFUND_IN_PROGRESS` | creates a `CUSTOMER_REFUND` payout freezing `SUSPENSE_REFUNDABLE_LIAB -> PAYOUT_LOCKED_LIAB` (template 8) |
+
+        `APPROVE_REFUND` requires the 127-byte admin `RefundTicket` fields
+        (`refund` object). The resulting payout follows the `merchant_payouts`
+        state machine; the order flips to `REFUNDED` when it reaches `COMPLETED`,
+        or back to `LATE_PAID_REVIEW` if the payout is cancelled.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewOrderRequest'
+      responses:
+        '200':
+          description: Decision applied. `payout` is present only for `APPROVE_REFUND`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [order]
+                properties:
+                  order: { $ref: '#/components/schemas/Order' }
+                  payout: { $ref: '#/components/schemas/Payout' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  # ==========================================================================
+  # 1b. MERCHANT — PAYOUTS / REFUNDS (X-Api-Key)
+  # ==========================================================================
+  /v1/payouts:
+    post:
+      tags: [merchant-payouts]
+      operationId: createPayout
+      summary: Request a merchant withdrawal (idempotent)
+      description: |
+        Freezes `amount` from `source_account` into `PAYOUT_LOCKED_LIAB`
+        (template 8 `PAYOUT_FLOW`, DR source / CR `PAYOUT_LOCKED_LIAB`) and creates a
+        `merchant_payouts` row in `LOCKED_QUEUED`, then the TxManager allocates a
+        persisted nonce and drives it through `outbound_tx_intents`.
+
+        * `payout_uuid` is the client-generated idempotency anchor embedded in
+          signer-facing payloads; `Idempotency-Key` governs HTTP replay.
+        * `to_address` **must** be a whitelist entry in `ACTIVE` status for this merchant
+          and `chain_id` (registered via `POST /v1/withdrawal-addresses`, leased by an
+          offline admin Ed25519 signature, past its 24h cooldown, before `valid_until`).
+        * For `SUSPENSE_*` sources the optional `source_order_id` links the draw-down to
+          a specific order for auditability.
+        * `409 PAYOUT_FROZEN` is returned while `merchants.payout_frozen = true`
+          (open `MERCHANT_REORG_RECEIVABLE` after a deep reorg — see
+          `POST /v1/admin/merchants/{merchantId}/payout-unfreeze`).
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePayoutRequest'
+      responses:
+        '201':
+          description: Payout accepted and source balance locked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payout'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    get:
+      tags: [merchant-payouts]
+      operationId: listPayouts
+      summary: List payouts & refunds (merchant view)
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/MerchantPayoutStatus' }
+          style: form
+          explode: true
+        - name: payout_kind
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/PayoutKind' }
+        - name: source_account
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/PayoutSourceAccount' }
+        - name: chain_id
+          in: query
+          required: false
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Page of payouts, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PayoutPage'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/payouts/{payoutId}:
+    get:
+      tags: [merchant-payouts]
+      operationId: getPayout
+      summary: Get a single payout / refund
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/PayoutId'
+      responses:
+        '200':
+          description: The payout, including its outbound intent linkage if allocated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payout'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/payouts/{payoutId}/cancel:
+    post:
+      tags: [merchant-payouts]
+      operationId: cancelPayout
+      summary: Cancel a payout before broadcast or after a failed attempt
+      description: |
+        Allowed from `LOCKED_QUEUED` (never broadcast) or `FAILED_RETRYABLE`
+        (intent `FAILED_REVERTED` / `CANCELLED_BY_FILLER`); unfreezes funds back to the
+        originating liability account (`PAYOUT_LOCKED_LIAB -> source_account`, template 8)
+        and parks the payout in `CANCELLED_UNLOCKED`.
+
+        Cancellation of an `IN_FLIGHT` payout is **not** done via this endpoint — the
+        TxManager performs an on-chain `GAP_FILLER` cancel internally; use the admin
+        outbound-queue view to observe it.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/PayoutId'
+      responses:
+        '200':
+          description: Payout cancelled and balance unfrozen.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payout'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/refunds:
+    post:
+      tags: [merchant-payouts]
+      operationId: createRefund
+      summary: Create a customer refund payout (idempotent)
+      description: |
+        Creates a `payout_kind = CUSTOMER_REFUND` payout against one of the three
+        suspense liability accounts (`SUSPENSE_OVERPAY_LIAB`,
+        `SUSPENSE_REFUNDABLE_LIAB`, `SUSPENSE_UNMATCHED_LIAB`) — e.g. refunding the
+        overpaid delta of an `OVERPAID` order, a late/underpaid deposit, a deposit into
+        a terminal order, or a wrong-asset misdeposit.
+
+        Unlike merchant withdrawals, `to_address` is a **customer** address that is not
+        whitelist-bound: authorization is the offline admin-signed 127-byte
+        `RefundTicket(chain_id, token, to, exact_amount, payout_uuid, retry_seq, expiry)`
+        supplied here as `admin_signature`. `vault-signer` verifies the ticket
+        field-by-field against the decoded `transfer(recipient, amount)` calldata and
+        its own clock (`now < expiry`) before signing.
+
+        `amount` must equal the ticket's `exact_amount` (full-ticket refund semantics).
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRefundRequest'
+      responses:
+        '201':
+          description: Refund payout created (`LOCKED_QUEUED`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Payout'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  # ==========================================================================
+  # 1c. MERCHANT — WITHDRAWAL ADDRESS WHITELIST (X-Api-Key)
+  # ==========================================================================
+  /v1/withdrawal-addresses:
+    post:
+      tags: [merchant-withdrawal-addresses]
+      operationId: registerWithdrawalAddress
+      summary: Submit an Ed25519-leased whitelist entry for registration
+      description: |
+        Registers a payout recipient address. The request carries the fields of the
+        69-byte offline-admin lease payload
+        `"VAULTFLOW_ADDR_V1" || chain_id || merchant_uuid || recipient_address || valid_until_unix`
+        plus the admin's raw 64-byte Ed25519 signature. The gateway reassembles the
+        canonical payload and forwards it to `vault-signer` (`RegisterWithdrawalAddress`),
+        which records `first_seen_at` under its own clock.
+
+        The address becomes payable only when **both** hold under the signer's clock:
+        `now >= first_seen_at + 24h` (status `PENDING_COOLDOWN -> ACTIVE`) and
+        `now < valid_until` (else `EXPIRED`). `valid_until` is a hard lease cap
+        (recommended <= 30 days out) and cannot be extended by the gateway.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterWithdrawalAddressRequest'
+      responses:
+        '201':
+          description: Whitelist entry registered (`PENDING_COOLDOWN`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WithdrawalAddress'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    get:
+      tags: [merchant-withdrawal-addresses]
+      operationId: listWithdrawalAddresses
+      summary: List whitelist entries
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/WithdrawalAddressStatus' }
+          style: form
+          explode: true
+        - name: chain_id
+          in: query
+          required: false
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Page of whitelist entries.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WithdrawalAddressPage'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/withdrawal-addresses/{withdrawalAddressId}:
+    delete:
+      tags: [merchant-withdrawal-addresses]
+      operationId: revokeWithdrawalAddress
+      summary: Request revocation of a whitelist entry
+      description: |
+        Marks the entry `REVOKED` in `gateway-core` and forwards
+        `RevokeWithdrawalAddress` to `vault-signer` so it is rejected at the policy
+        firewall even if a gateway instance is compromised mid-flight. Signer-side
+        revocation is authoritative; `signer_revoked: true` confirms the signer acked.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/WithdrawalAddressId'
+      responses:
+        '200':
+          description: Entry revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WithdrawalAddress'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  # ==========================================================================
+  # 1d. MERCHANT — LEDGER INTROSPECTION (X-Api-Key)
+  # ==========================================================================
+  /v1/ledger/accounts:
+    get:
+      tags: [merchant-ledger]
+      operationId: listLedgerAccounts
+      summary: List ledger account balances
+      description: |
+        Returns `ledger_accounts` rows visible to the caller: all accounts owned by the
+        authenticated merchant plus the **system-level** accounts (sentinel owner
+        `00000000-0000-0000-0000-000000000000`) so the console can render the full
+        14-account board. `account_type` is one of the 14 closed account codes of
+        ARCHITECTURE §6.1; `balance` is a non-negative decimal string (`NUMERIC(78,0)`).
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: chain_id
+          in: query
+          required: false
+          schema: { type: integer, format: int64 }
+        - name: asset_symbol
+          in: query
+          required: false
+          schema: { type: string }
+        - name: account_type
+          in: query
+          required: false
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/LedgerAccountType' }
+          style: form
+          explode: true
+        - name: owner_merchant_id
+          in: query
+          required: false
+          description: Explicit owner filter; must equal the caller or the zero sentinel UUID.
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Matching ledger accounts (bounded set, not cursor-paginated).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/LedgerAccount' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/ledger/transactions:
+    get:
+      tags: [merchant-ledger]
+      operationId: listLedgerTransactions
+      summary: List ledger transactions (journal headers)
+      description: |
+        Cursor-paginated `ledger_transactions`. `reference_type` is one of the nine
+        closed entry templates of ARCHITECTURE §6.2; `reference_id` is the business
+        object the entry template settled (order id, deposit id, batch id, intent id,
+        payout id or reorg audit id). Entries are fetched via `GET /v1/ledger/entries`.
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: reference_type
+          in: query
+          required: false
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/LedgerReferenceType' }
+          style: form
+          explode: true
+        - name: reference_id
+          in: query
+          required: false
+          schema: { type: string }
+      responses:
+        '200':
+          description: Page of ledger transactions, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LedgerTransactionPage'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/ledger/entries:
+    get:
+      tags: [merchant-ledger]
+      operationId: listLedgerEntries
+      summary: List ledger entries (debit/credit lines)
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: transaction_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+        - name: account_id
+          in: query
+          required: false
+          schema: { type: string, format: uuid }
+        - name: direction
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/LedgerDirection' }
+      responses:
+        '200':
+          description: Page of ledger entries, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LedgerEntryPage'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  # ==========================================================================
+  # 2. PUBLIC CASHIER (no auth)
+  # ==========================================================================
+  /v1/public/payments/{orderId}:
+    get:
+      tags: [public-cashier]
+      operationId: getPublicPayment
+      summary: Public order status for the hosted checkout page
+      description: |
+        Returns the payer-facing projection of an order. No merchant internals are
+        exposed. Includes everything the cashier needs to render the QR/dedeeplink and
+        the EIP-3009 gasless panel: `deposit_address`, expected/received amounts,
+        `eip3009` block (router address, `auth_nonce`, `valid_before`) and the chain's
+        current `safe_head` for the confirmation progress bar.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Public payment projection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicPayment'
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/public/payments/{orderId}/events:
+    get:
+      tags: [public-cashier]
+      operationId: streamPublicPaymentEvents
+      summary: SSE stream of live order progression
+      description: |
+        Standard Server-Sent Events stream (`Content-Type: text/event-stream`) fed by
+        the single-writer indexer and Redis Pub/Sub fan-out.
+
+        **Wire format** — each frame is:
+
+        ```
+        id: <monotonic uint64 event id>
+        event: <SseEventType>
+        data: <one-line JSON, schema depends on event type>
+        retry: 3000
+        ```
+
+        Frames are separated by a blank line. Every frame carries `retry: 3000`;
+        the server emits a `: heartbeat` comment line every 15 s. On reconnect the
+        client SHOULD send `Last-Event-ID`; the server replays missed events from its
+        short-lived buffer, else resyncs by sending a fresh `snapshot` event.
+
+        **Event types** (`SseEventType`):
+
+        | `event:` | `data` schema | Meaning |
+        |---|---|---|
+        | `snapshot` | `SseSnapshotData` | Current order projection, sent on connect / resync |
+        | `block_detected` | `SseDepositData` | New `onchain_deposits` row `DETECTED` against this order |
+        | `confirmation_progress` | `SseConfirmationData` | Confirmation count advanced toward `safe_head` |
+        | `paid` / `overpaid` / `partially_paid` | `SseOrderStatusData` | Order settled into the eponymous state |
+        | `expired` | `SseOrderStatusData` | `expires_at` passed with no effective same-asset deposit |
+        | `underpaid_expired_review` / `late_paid_review` | `SseOrderStatusData` | Parked into manual review |
+        | `refund_in_progress` / `refunded` | `SseOrderStatusData` | Refund payout lifecycle |
+        | `settled_reversed` / `reversal_resolved` | `SseOrderStatusData` | Deep-reorg red reversal lifecycle |
+
+        **Retry / fallback semantics**: the stream is advisory. If it drops or the
+        client's `EventSource` errors repeatedly, fall back to polling
+        `GET /v1/public/payments/{orderId}` every 3 s (the server sets `retry: 3000`
+        to the same cadence). Redis outage transparently degrades fan-out to in-process
+        delivery; ordering per `id` is still guaranteed.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - name: Last-Event-ID
+          in: header
+          required: false
+          description: "Resume token from the last received `id:` field."
+          schema: { type: string, pattern: '^[0-9]+$' }
+      responses:
+        '200':
+          description: SSE stream (see endpoint description for frame grammar & event types).
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/SseFrame'
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/public/payments/{orderId}/eip3009:
+    post:
+      tags: [public-cashier]
+      operationId: submitEip3009Authorization
+      summary: Submit a signed USDC EIP-3009 authorization for gasless relay
+      description: |
+        Accepts the payer's EIP-712 `ReceiveWithAuthorization` signature and queues an
+        `EIP3009_RELAY` outbound intent so `relayer_hot_wallet` calls
+        `EIP3009PayRouter.payOrderWithAuthorization(salt, ...)`, which self-derives the
+        vault address and pulls USDC via `receiveWithAuthorization`.
+
+        Frozen bindings the signer and router both enforce:
+        `to == chain EIP3009PayRouter`, `validBefore == order.expires_at`,
+        `nonce == authNonce == keccak256(abi.encode(chainId, salt))`,
+        `value == order.expected_amount`. Any deviation yields `400 SIGNER_REJECTED`-class
+        validation failure. Only served while the order is unpaid and unexpired and the
+        asset's `supports_eip3009` flag is set (USDC only).
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Eip3009Submission'
+      responses:
+        '202':
+          description: Authorization accepted; relay intent queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [order_id, intent_id, intent_status]
+                properties:
+                  order_id: { type: string, format: uuid }
+                  intent_id: { type: string, format: uuid }
+                  intent_status: { $ref: '#/components/schemas/OutboundTxIntentStatus' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  # ==========================================================================
+  # 3. ADMIN / OPS (JWT Bearer)
+  # ==========================================================================
+  /v1/admin/reconciliation/status:
+    get:
+      tags: [admin-ops]
+      operationId: getReconciliationStatus
+      summary: Latest double-layer invariant check result
+      description: |
+        Returns the most recent `InvariantChecker` run — both layers of ARCHITECTURE §8.3:
+
+        1. **Trial balance** per `(chain_id, asset_symbol)`:
+           `SUM(DEBIT) == SUM(CREDIT)` across `ledger_entries` and all 14 account
+           `balance >= 0`.
+        2. **On-chain vs ledger custody snapshot** at `safe_head_height`:
+           `Σ confirmed-unswept DepositVault balances == CUSTODY_UNSWEPT`,
+           `cold wallet balance == CUSTODY_COLD`,
+           `payout hot wallet stablecoin balance == CUSTODY_HOT_PAYOUT`,
+           `hot wallets' native ETH == HOT_WALLET_NATIVE` (exact to 1 wei).
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: "Latest run (or `status: NEVER_RUN` if none has completed)."
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReconciliationReport'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/admin/reconciliation/run:
+    post:
+      tags: [admin-ops]
+      operationId: runReconciliation
+      summary: Trigger an on-demand invariant check
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                chain_id:
+                  type: integer
+                  format: int64
+                  description: Restrict the run to one chain; omit for all chains.
+      responses:
+        '202':
+          description: Run accepted; poll `GET /v1/admin/reconciliation/status`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, status]
+                properties:
+                  run_id: { type: string, format: uuid }
+                  status: { $ref: '#/components/schemas/ReconciliationRunStatus' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/admin/outbound-queue:
+    get:
+      tags: [admin-ops]
+      operationId: getOutboundQueue
+      summary: Outbound tx pipeline — intents, attempts, nonce cursors, halt state
+      description: |
+        Ops view of the TxManager pipeline: paginated `outbound_tx_intents` (each with
+        its full `outbound_tx_attempts` RBF/dropped/filler history and gas-fee ladder),
+        the persisted `wallet_nonce_cursors` per hot wallet, and the list of wallets
+        currently halted by `NONCE_STOLEN_HALT` (out-of-band key consumption circuit
+        breaker, ARCHITECTURE §4.2).
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: array
+            items: { $ref: '#/components/schemas/OutboundTxIntentStatus' }
+          style: form
+          explode: true
+        - name: intent_type
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/OutboundIntentType' }
+        - name: chain_id
+          in: query
+          required: false
+          schema: { type: integer, format: int64 }
+        - name: wallet_address
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/EvmAddress' }
+      responses:
+        '200':
+          description: Outbound pipeline snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OutboundQueueView'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/admin/signer/health:
+    get:
+      tags: [admin-ops]
+      operationId: getSignerHealth
+      summary: Signer liveness, policy state & audit-chain integrity
+      description: |
+        Proxies `vault-signer`'s `GetSignerHealth` over mTLS and overlays the result of
+        the gateway's independent 5-minute `VerifyAuditChain` patrol: key/wallet
+        inventory (addresses only — no key material ever leaves the signer),
+        24h circuit-breaker usage, whitelist counters, intent-slot stats and the
+        SHA-256 hash-chain verification verdict.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Health snapshot (degraded fields populated on partial failure).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignerHealth'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/admin/quarantined-vaults:
+    get:
+      tags: [admin-ops]
+      operationId: listQuarantinedVaults
+      summary: List quarantined deposit vaults
+      description: |
+        `deposit_addresses` rows with `is_quarantined = true` — vaults whose
+        `sweep` reverted inside a batch (e.g. Tether `isBlackListed` freeze or
+        balance anomaly), isolated per `VaultQuarantined` while the rest of the
+        batch settled normally.
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: chain_id
+          in: query
+          required: false
+          schema: { type: integer, format: int64 }
+      responses:
+        '200':
+          description: Page of quarantined vaults.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QuarantinedVaultPage'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /v1/admin/merchants/{merchantId}/payout-unfreeze:
+    post:
+      tags: [admin-ops]
+      operationId: unfreezeMerchantPayouts
+      summary: Release `payout_frozen` after reorg receivable settles
+      description: |
+        Closes the §4.3 freeze loop: a deep reorg that drove `MERCHANT_AVAILABLE`
+        negative books the shortfall into `MERCHANT_REORG_RECEIVABLE` and sets
+        `merchants.payout_frozen = true`. Once top-ups or a write-off return the
+        receivable to zero, an admin reviews and calls this endpoint to clear the flag.
+        Returns `409 REORG_RECEIVABLE_OUTSTANDING` (with the live balance in `details`)
+        if the receivable is still positive.
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/MerchantId'
+      responses:
+        '200':
+          description: Merchant payout capability restored.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MerchantFreezeState'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  # ==========================================================================
+  # 4. DEV SIMULATOR (ENABLE_DEV_SIMULATOR=true only)
+  # ==========================================================================
+  /v1/sim/anvil/{action}:
+    post:
+      tags: [dev-simulator]
+      operationId: simAnvil
+      summary: Raw Anvil chain-control passthrough
+      description: |
+        Thin passthrough over the Anvil JSON-RPC control surface used by the drill
+        console. `action` maps: `snapshot -> evm_snapshot`,
+        `mine -> anvil_mine` (optional `params.blocks`),
+        `revert -> evm_revert` (requires `params.snapshot_id`),
+        `drop-transaction -> anvil_dropTransaction` (requires `params.tx_hash`,
+        simulating a mempool Dropped eviction). The raw JSON-RPC `result` is echoed
+        back verbatim in `result`.
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SimAnvilAction'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                chain_id:
+                  type: integer
+                  format: int64
+                  description: Target Anvil instance; defaults to the primary dev chain.
+                params:
+                  type: object
+                  description: |
+                    Action-specific parameters: `mine` -> `{ "blocks": <uint> }`;
+                    `revert` -> `{ "snapshot_id": "<0x..>" }`;
+                    `drop-transaction` -> `{ "tx_hash": "<0x..64B>" }`;
+                    `snapshot` takes none.
+                  properties:
+                    blocks: { type: integer, minimum: 1 }
+                    snapshot_id: { type: string }
+                    tx_hash: { $ref: '#/components/schemas/TxHash' }
+      responses:
+        '200':
+          description: Passthrough result.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [action, result]
+                properties:
+                  action: { $ref: '#/components/schemas/SimAnvilAction' }
+                  result:
+                    description: Raw Anvil JSON-RPC `result` value (shape depends on action).
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+      x-dev-only: true
+
+  /v1/sim/scenarios/{scenario}:
+    post:
+      tags: [dev-simulator]
+      operationId: runSimScenario
+      summary: Launch one of the four ARCHITECTURE §8 adversarial scenarios
+      description: |
+        Orchestrates a scripted end-to-end drill against the local Anvil stack and
+        returns a `run_id` plus the already-executed step log; poll
+        `GET /v1/sim/runs/{runId}` for progression.
+
+        | `scenario` | Drill (ARCHITECTURE §8 / plan.md Wave-3) |
+        |---|---|
+        | `shallow-reorg` | Orphan unconfirmed deposits (`-> ORPHANED_SHALLOW`) and in-flight sweeps (`INCLUDED_PENDING_SAFE -> BROADCASTED/IN_FLIGHT`), re-mine a competing fork, verify conflict-free re-inclusion. |
+        | `deep-reorg` | Settle a deposit (h=100), sweep to cold (h=105), spend merchant balance on a payout, then force-revert to h=99 and watch the LIFO red-reversal: sweep reversal restores `CUSTODY_UNSWEPT`, inbound reversal shortfalls book `MERCHANT_REORG_RECEIVABLE` and auto-freeze payouts. |
+        | `blacklist-returnbomb` | Blacklist one of five sweep targets in `MockUSDT`, add a `MockReturnBombToken` (2 MB returndata) transfer, run a batch sweep, verify `is_quarantined` isolation + `VaultQuarantined`, then inject a reverting tx and check `HOT_WALLET_NATIVE` stays 1-wei accurate via `GAS_SETTLE`. |
+        | `signer-penetration` | Replay four classes of forged requests to `vault-signer` (tampered cold wallet, tampered `salt`, pre-cooldown/expired-lease withdrawal, unsigned/over-amount `RefundTicket`) plus a legitimate same-nonce RBF + `GAP_FILLER` slot dance; expect 100% policy rejection on forgeries, clean idempotent signing on the legit pair, and a `VerifyAuditChain`-valid trail. |
+
+        `options` is a scenario-specific free-form object (documented per scenario in
+        the sim package); unknown keys are rejected with `400 VALIDATION_FAILED`.
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/SimScenario'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                chain_id:
+                  type: integer
+                  format: int64
+                options:
+                  type: object
+                  description: Scenario-specific tuning knobs (e.g. fork depth, batch size, target merchant).
+                  additionalProperties: true
+      responses:
+        '202':
+          description: Scenario run accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimRun'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+      x-dev-only: true
+
+  /v1/sim/runs/{runId}:
+    get:
+      tags: [dev-simulator]
+      operationId: getSimRun
+      summary: Poll a scenario run's step log
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SimRunId'
+      responses:
+        '200':
+          description: Run state and step log so far.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimRun'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+      x-dev-only: true
+
+# ============================================================================
+# COMPONENTS
+# ============================================================================
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: Merchant API key (server stores `api_key_hash` only).
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Ops-console JWT.
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Required on every non-GET request. Scoped per authenticated principal
+        (merchant id / admin subject / `public:<orderId>`). Replays: identical request
+        body SHA-256 -> stored first response; divergent body -> `409 IDEMPOTENCY_CONFLICT`.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+        pattern: '^[A-Za-z0-9\-_:.]+$'
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque continuation token from a previous page's `page.next_cursor`.
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    PayoutId:
+      name: payoutId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    WithdrawalAddressId:
+      name: withdrawalAddressId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    MerchantId:
+      name: merchantId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    SimAnvilAction:
+      name: action
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/SimAnvilAction' }
+    SimScenario:
+      name: scenario
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/SimScenario' }
+    SimRunId:
+      name: runId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  responses:
+    BadRequest:
+      description: Malformed request or validation failure.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unauthorized:
+      description: Missing/invalid API key or JWT.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: Authenticated but not permitted (e.g. wrong role, feature disabled).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource does not exist (or is outside the caller's scope).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: |
+        State or idempotency conflict — `IDEMPOTENCY_CONFLICT`,
+        `ORDER_STATE_INVALID`, `PAYOUT_FROZEN`, `REORG_RECEIVABLE_OUTSTANDING`,
+        `ALREADY_TERMINAL`, `RECONCILIATION_RUNNING`, etc. Inspect `error.code`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unprocessable:
+      description: Well-formed but rejected by business rules (insufficient balance, untrusted address, expired ticket).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: Token-bucket / sliding-window limit exceeded (`Retry-After` header set).
+      headers:
+        Retry-After:
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServiceUnavailable:
+      description: Upstream dependency (signer / RPC) unreachable.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    # ------------------------------------------------------------------
+    # Primitive / frozen formats
+    # ------------------------------------------------------------------
+    Amount:
+      type: string
+      title: NUMERIC(78,0) decimal string
+      description: Unsigned integer in atomic units (token base units / wei / gas price). Always a string — never a JSON number.
+      pattern: '^(0|[1-9][0-9]{0,77})$'
+      example: '100000000'
+    EvmAddress:
+      type: string
+      pattern: '^0x[0-9a-fA-F]{40}$'
+      example: '0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC'
+    TxHash:
+      type: string
+      pattern: '^0x[0-9a-fA-F]{64}$'
+    Bytes32:
+      type: string
+      pattern: '^0x[0-9a-fA-F]{64}$'
+    Ed25519Signature:
+      type: string
+      description: Raw 64-byte Ed25519 signature, hex-encoded (optional `0x` prefix).
+      pattern: '^(0x)?[0-9a-fA-F]{128}$'
+    PageInfo:
+      type: object
+      required: [has_more]
+      properties:
+        next_cursor:
+          type: ["string", "null"]
+          description: Pass as `cursor` for the next page; null when `has_more` is false.
+        has_more: { type: boolean }
+
+    # ------------------------------------------------------------------
+    # Error envelope
+    # ------------------------------------------------------------------
+    ErrorCode:
+      type: string
+      enum:
+        - VALIDATION_FAILED
+        - IDEMPOTENCY_KEY_REQUIRED
+        - IDEMPOTENCY_CONFLICT
+        - UNAUTHORIZED
+        - FORBIDDEN
+        - NOT_FOUND
+        - RATE_LIMITED
+        - ORDER_STATE_INVALID
+        - PAYOUT_STATE_INVALID
+        - INSUFFICIENT_BALANCE
+        - PAYOUT_FROZEN
+        - REORG_RECEIVABLE_OUTSTANDING
+        - ADDRESS_NOT_WHITELISTED
+        - SIGNER_REJECTED
+        - REFUND_TICKET_INVALID
+        - ALREADY_TERMINAL
+        - RECONCILIATION_RUNNING
+        - FEATURE_DISABLED
+        - UPSTREAM_UNAVAILABLE
+        - INTERNAL
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { $ref: '#/components/schemas/ErrorCode' }
+            message:
+              type: string
+              description: Human-readable, safe to display.
+            details:
+              type: object
+              additionalProperties: true
+              description: 'Optional structured context (e.g. `{"reorg_receivable_balance": "12..."}`).'
+            request_id:
+              type: string
+              description: Correlation id echoed from `X-Request-Id` or generated.
+
+    # ------------------------------------------------------------------
+    # State machine enums — EXACTLY ARCHITECTURE §5 / schema CHECKs
+    # ------------------------------------------------------------------
+    OnchainDepositStatus:
+      type: string
+      description: §5.1 `onchain_deposits.status` (4 states).
+      enum: [DETECTED, ORPHANED_SHALLOW, FINALIZED, ORPHANED_DEEP]
+    PaymentOrderStatus:
+      type: string
+      description: §5.2 `payment_orders.status` (11 states).
+      enum:
+        - AWAITING_PAYMENT
+        - PARTIALLY_PAID
+        - PAID
+        - OVERPAID
+        - EXPIRED
+        - UNDERPAID_EXPIRED_REVIEW
+        - LATE_PAID_REVIEW
+        - REFUND_IN_PROGRESS
+        - REFUNDED
+        - SETTLED_REVERSED
+        - REVERSAL_RESOLVED
+    OutboundTxIntentStatus:
+      type: string
+      description: §5.3 `outbound_tx_intents.status` (7 states).
+      enum:
+        - QUEUED
+        - IN_FLIGHT
+        - INCLUDED_PENDING_SAFE
+        - CONFIRMED
+        - FAILED_REVERTED
+        - CANCELLED_BY_FILLER
+        - NONCE_STOLEN_HALT
+    MerchantPayoutStatus:
+      type: string
+      description: §5.4 `merchant_payouts.status` (5 states).
+      enum: [LOCKED_QUEUED, IN_FLIGHT, COMPLETED, FAILED_RETRYABLE, CANCELLED_UNLOCKED]
+    OutboundTxAttemptStatus:
+      type: string
+      description: "`outbound_tx_attempts.status`."
+      enum: [BROADCASTED, INCLUDED_UNSAFE, FINALIZED, SUPERSEDED, DROPPED]
+    OutboundIntentType:
+      type: string
+      description: "`outbound_tx_intents.intent_type`."
+      enum: [SWEEP_BATCH, MERCHANT_PAYOUT, EIP3009_RELAY, NONCE_GAP_FILLER]
+    OutboundAttemptKind:
+      type: string
+      description: "`outbound_tx_attempts.attempt_kind`."
+      enum: [PRIMARY_INTENT, GAP_FILLER]
+    OnchainDepositCategory:
+      type: string
+      description: §4.1 four-branch inbound classification.
+      enum: [ORDER_MATCH, WRONG_ASSET, POST_TERMINAL, TREASURY_REBALANCE, TOPUP]
+    WithdrawalAddressStatus:
+      type: string
+      description: "`merchant_withdrawal_addresses.status`."
+      enum: [PENDING_COOLDOWN, ACTIVE, EXPIRED, REVOKED]
+    PayoutKind:
+      type: string
+      description: "`merchant_payouts.payout_kind`."
+      enum: [WITHDRAWAL, CUSTOMER_REFUND]
+    PayoutSourceAccount:
+      type: string
+      description: |
+        `merchant_payouts.source_account_type` — the four drawable liability accounts
+        (§5.4): merchant settlement balance plus the three suspense buckets.
+      enum:
+        - MERCHANT_AVAILABLE
+        - SUSPENSE_OVERPAY_LIAB
+        - SUSPENSE_REFUNDABLE_LIAB
+        - SUSPENSE_UNMATCHED_LIAB
+    RefundSourceAccount:
+      type: string
+      description: Suspense-only subset allowed for `CUSTOMER_REFUND` payouts.
+      enum:
+        - SUSPENSE_OVERPAY_LIAB
+        - SUSPENSE_REFUNDABLE_LIAB
+        - SUSPENSE_UNMATCHED_LIAB
+    LedgerAccountType:
+      type: string
+      description: |
+        §6.1 closed 14-account chart. `normal_side = DEBIT`: `CUSTODY_UNSWEPT`,
+        `CUSTODY_COLD`, `CUSTODY_HOT_PAYOUT`, `HOT_WALLET_NATIVE`, `GAS_EXPENSE`,
+        `MERCHANT_REORG_RECEIVABLE`. `normal_side = CREDIT`: `ORDER_ESCROW_LIAB`,
+        `MERCHANT_AVAILABLE`, `PAYOUT_LOCKED_LIAB`, `SUSPENSE_OVERPAY_LIAB`,
+        `SUSPENSE_REFUNDABLE_LIAB`, `SUSPENSE_UNMATCHED_LIAB`,
+        `TREASURY_EQUITY_CAPITAL`, `FEE_REVENUE`.
+      enum:
+        - CUSTODY_UNSWEPT
+        - CUSTODY_COLD
+        - CUSTODY_HOT_PAYOUT
+        - HOT_WALLET_NATIVE
+        - GAS_EXPENSE
+        - MERCHANT_REORG_RECEIVABLE
+        - ORDER_ESCROW_LIAB
+        - MERCHANT_AVAILABLE
+        - PAYOUT_LOCKED_LIAB
+        - SUSPENSE_OVERPAY_LIAB
+        - SUSPENSE_REFUNDABLE_LIAB
+        - SUSPENSE_UNMATCHED_LIAB
+        - TREASURY_EQUITY_CAPITAL
+        - FEE_REVENUE
+    LedgerDirection:
+      type: string
+      enum: [DEBIT, CREDIT]
+    LedgerReferenceType:
+      type: string
+      description: §6.2 nine closed journal templates.
+      enum:
+        - TREASURY_TOPUP
+        - INTERNAL_TREASURY_REBALANCE
+        - DEPOSIT_FINALIZED
+        - ORDER_SETTLE
+        - ORDER_SUSPENSE
+        - SWEEP_SETTLE
+        - GAS_SETTLE
+        - PAYOUT_FLOW
+        - REORG_REVERSAL
+    ReviewAction:
+      type: string
+      enum: [ACCEPT_UNDERPAID_DISCOUNT, ACCEPT_LATE_PAYMENT, APPROVE_REFUND]
+    WalletRole:
+      type: string
+      enum: [RELAYER_HOT, PAYOUT_HOT]
+    CustodyCheckType:
+      type: string
+      description: The four chain-vs-ledger snapshot checks of §8.3 layer 2.
+      enum:
+        - UNSWEPT_DEPOSIT_VAULTS   # Σ DepositVault confirmed-unswept == CUSTODY_UNSWEPT
+        - COLD_WALLET_BALANCE      # cold wallet token balance == CUSTODY_COLD
+        - PAYOUT_HOT_WALLET_BALANCE # payout hot wallet token balance == CUSTODY_HOT_PAYOUT
+        - HOT_WALLETS_NATIVE_BALANCE # both hot wallets' native ETH == HOT_WALLET_NATIVE
+    ReconciliationRunStatus:
+      type: string
+      enum: [NEVER_RUN, RUNNING, PASSED, FAILED]
+    ReconciliationTrigger:
+      type: string
+      enum: [MANUAL, SCHEDULED]
+    SimAnvilAction:
+      type: string
+      enum: [snapshot, mine, revert, drop-transaction]
+    SimScenario:
+      type: string
+      enum: [shallow-reorg, deep-reorg, blacklist-returnbomb, signer-penetration]
+    SimRunStatus:
+      type: string
+      enum: [RUNNING, COMPLETED, FAILED]
+    SseEventType:
+      type: string
+      description: |
+        Values of the SSE `event:` field on `/v1/public/payments/{orderId}/events`.
+        Terminal-ish business states reuse the snake_case form of `PaymentOrderStatus`.
+      enum:
+        - snapshot
+        - block_detected
+        - confirmation_progress
+        - paid
+        - overpaid
+        - partially_paid
+        - expired
+        - underpaid_expired_review
+        - late_paid_review
+        - refund_in_progress
+        - refunded
+        - settled_reversed
+        - reversal_resolved
+
+    # ------------------------------------------------------------------
+    # Orders
+    # ------------------------------------------------------------------
+    CreateOrderRequest:
+      type: object
+      required: [chain_id, asset_symbol, amount]
+      properties:
+        merchant_order_ref:
+          type: string
+          maxLength: 128
+          description: Merchant-side order reference for reconciliation/display.
+        chain_id: { type: integer, format: int64, example: 84532 }
+        asset_symbol:
+          type: string
+          description: Supported asset symbol (`supported_assets`), e.g. `USDT`, `USDC`.
+          example: USDC
+        amount:
+          $ref: '#/components/schemas/Amount'
+          # expected_amount — what the payer must deposit, in atomic units.
+        expires_in_seconds:
+          type: integer
+          minimum: 60
+          maximum: 86400
+          default: 1800
+          description: Order lifetime; `expires_at = created_at + expires_in_seconds`.
+    Order:
+      type: object
+      description: Merchant projection of `payment_orders` + bound `deposit_addresses`.
+      required:
+        - id
+        - merchant_id
+        - chain_id
+        - asset_symbol
+        - expected_amount
+        - received_amount
+        - status
+        - deposit_address
+        - cashier_url
+        - expires_at
+        - created_at
+      properties:
+        id: { type: string, format: uuid }
+        merchant_id: { type: string, format: uuid }
+        merchant_order_ref: { type: ["string", "null"] }
+        chain_id: { type: integer, format: int64 }
+        asset_symbol: { type: string }
+        token_contract: { $ref: '#/components/schemas/EvmAddress' }
+        expected_amount: { $ref: '#/components/schemas/Amount' }
+        received_amount:
+          $ref: '#/components/schemas/Amount'
+          # only same-asset FINALIZED deposits accrue here.
+        status: { $ref: '#/components/schemas/PaymentOrderStatus' }
+        deposit_address_id: { type: string, format: uuid }
+        deposit_address:
+          $ref: '#/components/schemas/EvmAddress'
+          # 1:1 CREATE2 vault; vault.sweep is callable only by BatchSweeper.
+        deposit_address_deployed:
+          type: boolean
+          description: Whether the EIP-1167 proxy is on-chain yet (deployed lazily at first sweep).
+        create2_salt: { $ref: '#/components/schemas/Bytes32' }
+        cashier_url:
+          type: string
+          description: Hosted checkout path for this order (relative URL).
+          example: /pay/018e8f9a-7c2b-7a3e-9d5f-2c1a4b6e8f01
+        eip3009:
+          anyOf:
+            - $ref: '#/components/schemas/Eip3009Hint'
+            - type: "null"
+          description: Present iff the asset supports EIP-3009 (USDC); null otherwise.
+        expires_at: { type: string, format: date-time }
+        settled_at: { type: ["string", "null"], format: date-time }
+        created_at: { type: string, format: date-time }
+    OrderPage:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Order' }
+        page: { $ref: '#/components/schemas/PageInfo' }
+    Eip3009Hint:
+      type: object
+      description: |
+        Present when `asset.supports_eip3009` (USDC). Binds the payer's typed data:
+        `to = router_address`, `validBefore = order.expires_at`,
+        `nonce = auth_nonce = keccak256(abi.encode(chainId, salt))`.
+      required: [supported, router_address, auth_nonce]
+      properties:
+        supported: { type: boolean }
+        router_address: { $ref: '#/components/schemas/EvmAddress' }
+        auth_nonce: { $ref: '#/components/schemas/Bytes32' }
+        token_contract: { $ref: '#/components/schemas/EvmAddress' }
+    ReviewOrderRequest:
+      type: object
+      required: [action]
+      properties:
+        action: { $ref: '#/components/schemas/ReviewAction' }
+        note:
+          type: string
+          maxLength: 512
+        refund:
+          $ref: '#/components/schemas/RefundTicketFields'
+          description: Required iff `action = APPROVE_REFUND`.
+
+    # ------------------------------------------------------------------
+    # Payouts / refunds
+    # ------------------------------------------------------------------
+    RefundTicketFields:
+      type: object
+      description: |
+        Field-level decomposition of the 127-byte `RefundTicket` signed offline by the
+        admin approver key. The gateway reassembles
+        `"VAULTFLOW_REFUND_V1" || chain_id(8B BE) || token_address(20B) || to_address(20B)
+        || exact_amount_u256(32B BE) || payout_uuid(16B) || retry_seq(4B BE) || expiry_unix(8B BE)`
+        and ships it to `vault-signer`, which verifies `admin_signature` and enforces
+        field-equality with the decoded `transfer()` calldata plus `now < expiry_unix`.
+      required: [to_address, retry_seq, expiry_unix, admin_signature]
+      properties:
+        to_address:
+          $ref: '#/components/schemas/EvmAddress'
+          # customer destination — NOT whitelist-bound; ticket-authorized instead.
+        retry_seq:
+          type: integer
+          format: int32
+          minimum: 0
+          description: New ticket seq when re-issuing after an on-chain revert consumed the nonce; `0` for first issue.
+        expiry_unix:
+          type: integer
+          format: int64
+          description: Signer-clock deadline for the ticket.
+        admin_signature: { $ref: '#/components/schemas/Ed25519Signature' }
+    CreatePayoutRequest:
+      type: object
+      required: [payout_uuid, source_account, chain_id, asset_symbol, amount, to_address]
+      properties:
+        payout_uuid:
+          type: string
+          format: uuid
+          description: Client-generated idempotency anchor carried into signer payloads.
+        source_account: { $ref: '#/components/schemas/PayoutSourceAccount' }
+        source_order_id:
+          type: ["string", "null"]
+          format: uuid
+          description: Optional order linkage for `SUSPENSE_*` draw-downs.
+        chain_id: { type: integer, format: int64 }
+        asset_symbol: { type: string }
+        amount: { $ref: '#/components/schemas/Amount' }
+        to_address:
+          $ref: '#/components/schemas/EvmAddress'
+          # must be an ACTIVE merchant whitelist entry for WITHDRAWAL payouts.
+    CreateRefundRequest:
+      type: object
+      required: [payout_uuid, source_account, chain_id, asset_symbol, amount]
+      allOf:
+        - required: [refund_ticket]
+      properties:
+        payout_uuid:
+          type: string
+          format: uuid
+          description: The `payout_uuid(16B)` embedded in the RefundTicket — idempotency anchor.
+        source_account: { $ref: '#/components/schemas/RefundSourceAccount' }
+        source_order_id:
+          type: ["string", "null"]
+          format: uuid
+        chain_id: { type: integer, format: int64 }
+        asset_symbol: { type: string }
+        amount:
+          $ref: '#/components/schemas/Amount'
+          # MUST equal the ticket's exact_amount.
+        refund_ticket: { $ref: '#/components/schemas/RefundTicketFields' }
+    Payout:
+      type: object
+      description: "`merchant_payouts` projection (withdrawal or customer refund)."
+      required:
+        - id
+        - merchant_id
+        - payout_kind
+        - source_account_type
+        - chain_id
+        - asset_symbol
+        - to_address
+        - amount
+        - retry_seq
+        - status
+        - created_at
+      properties:
+        id: { type: string, format: uuid }
+        merchant_id: { type: string, format: uuid }
+        payout_kind: { $ref: '#/components/schemas/PayoutKind' }
+        source_account_type: { $ref: '#/components/schemas/PayoutSourceAccount' }
+        source_order_id: { type: ["string", "null"], format: uuid }
+        chain_id: { type: integer, format: int64 }
+        asset_symbol: { type: string }
+        to_address: { $ref: '#/components/schemas/EvmAddress' }
+        amount: { $ref: '#/components/schemas/Amount' }
+        retry_seq: { type: integer, format: int32 }
+        status: { $ref: '#/components/schemas/MerchantPayoutStatus' }
+        outbound_intent_id:
+          type: ["string", "null"]
+          format: uuid
+          description: Linked `outbound_tx_intents.id` once a nonce is allocated.
+        tx_hash:
+          anyOf:
+            - $ref: '#/components/schemas/TxHash'
+            - type: "null"
+          # hash of the attempt that finalized (convenience mirror).
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    PayoutPage:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Payout' }
+        page: { $ref: '#/components/schemas/PageInfo' }
+
+    # ------------------------------------------------------------------
+    # Withdrawal whitelist
+    # ------------------------------------------------------------------
+    RegisterWithdrawalAddressRequest:
+      type: object
+      description: |
+        The `merchant_uuid` segment of the 69-byte lease payload is the authenticated
+        merchant's id — it is bound by the server, not sent by the client.
+      required: [chain_id, address, valid_until_unix, admin_signature]
+      properties:
+        chain_id: { type: integer, format: int64 }
+        address: { $ref: '#/components/schemas/EvmAddress' }
+        valid_until_unix:
+          type: integer
+          format: int64
+          description: Hard lease cap embedded in the signed payload (recommended <= now + 30d).
+        admin_signature:
+          $ref: '#/components/schemas/Ed25519Signature'
+          # over "VAULTFLOW_ADDR_V1" || chain_id || merchant_uuid || address || valid_until_unix
+    WithdrawalAddress:
+      type: object
+      required:
+        - id
+        - merchant_id
+        - chain_id
+        - address
+        - status
+        - valid_until
+      properties:
+        id: { type: string, format: uuid }
+        merchant_id: { type: string, format: uuid }
+        chain_id: { type: integer, format: int64 }
+        address: { $ref: '#/components/schemas/EvmAddress' }
+        status: { $ref: '#/components/schemas/WithdrawalAddressStatus' }
+        valid_until: { type: string, format: date-time }
+        first_seen_at:
+          type: ["string", "null"]
+          format: date-time
+          description: Signer-clock registration time; cooldown ends `first_seen_at + 24h`.
+        signer_revoked:
+          type: boolean
+          description: True once `vault-signer` acknowledged the revocation.
+        created_at: { type: string, format: date-time }
+    WithdrawalAddressPage:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/WithdrawalAddress' }
+        page: { $ref: '#/components/schemas/PageInfo' }
+
+    # ------------------------------------------------------------------
+    # Ledger introspection
+    # ------------------------------------------------------------------
+    LedgerAccount:
+      type: object
+      required: [id, owner_merchant_id, chain_id, asset_symbol, account_type, normal_side, balance]
+      properties:
+        id: { type: string, format: uuid }
+        owner_merchant_id:
+          type: string
+          format: uuid
+          description: Merchant owner, or zero sentinel UUID `00000000-0000-0000-0000-000000000000` for system accounts.
+        chain_id: { type: integer, format: int64 }
+        asset_symbol: { type: string }
+        account_type: { $ref: '#/components/schemas/LedgerAccountType' }
+        normal_side: { $ref: '#/components/schemas/LedgerDirection' }
+        balance:
+          $ref: '#/components/schemas/Amount'
+          # invariant: >= 0, enforced by CHECK + FOR UPDATE row locks.
+    LedgerTransaction:
+      type: object
+      required: [id, reference_type, reference_id, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        reference_type: { $ref: '#/components/schemas/LedgerReferenceType' }
+        reference_id:
+          type: string
+          description: Business anchor (order/deposit/batch/intent/payout/reorg-audit id).
+        description: { type: ["string", "null"] }
+        created_at: { type: string, format: date-time }
+    LedgerTransactionPage:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/LedgerTransaction' }
+        page: { $ref: '#/components/schemas/PageInfo' }
+    LedgerEntry:
+      type: object
+      required: [id, transaction_id, account_id, direction, amount, balance_after, created_at]
+      properties:
+        id: { type: string, format: uuid }
+        transaction_id: { type: string, format: uuid }
+        account_id: { type: string, format: uuid }
+        account_type: { $ref: '#/components/schemas/LedgerAccountType' }
+        owner_merchant_id: { type: string, format: uuid }
+        direction: { $ref: '#/components/schemas/LedgerDirection' }
+        amount:
+          $ref: '#/components/schemas/Amount'
+          # invariant: > 0
+        balance_after:
+          $ref: '#/components/schemas/Amount'
+          # post-entry snapshot taken under the account row lock.
+        created_at: { type: string, format: date-time }
+    LedgerEntryPage:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/LedgerEntry' }
+        page: { $ref: '#/components/schemas/PageInfo' }
+
+    # ------------------------------------------------------------------
+    # Public cashier
+    # ------------------------------------------------------------------
+    PublicPayment:
+      type: object
+      description: Payer-facing projection (merchant internals stripped).
+      required:
+        - order_id
+        - status
+        - chain_id
+        - asset_symbol
+        - token_contract
+        - decimals
+        - expected_amount
+        - received_amount
+        - deposit_address
+        - expires_at
+      properties:
+        order_id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/PaymentOrderStatus' }
+        merchant_name: { type: string }
+        merchant_order_ref: { type: ["string", "null"] }
+        chain_id: { type: integer, format: int64 }
+        asset_symbol: { type: string }
+        token_contract: { $ref: '#/components/schemas/EvmAddress' }
+        decimals: { type: integer, example: 6 }
+        expected_amount: { $ref: '#/components/schemas/Amount' }
+        received_amount: { $ref: '#/components/schemas/Amount' }
+        deposit_address: { $ref: '#/components/schemas/EvmAddress' }
+        deposit_address_deployed: { type: boolean }
+        expires_at: { type: string, format: date-time }
+        seconds_remaining:
+          type: integer
+          description: Server-computed `expires_at - now` (<= 0 once expired).
+        settled_at: { type: ["string", "null"], format: date-time }
+        safe_head_height:
+          type: integer
+          format: int64
+          description: Current chain safe-head used for confirmation progress.
+        required_confirmations:
+          type: integer
+          description: "`safe_head` lag used by the progress bar."
+        eip3009:
+          anyOf:
+            - $ref: '#/components/schemas/Eip3009Hint'
+            - type: "null"
+          description: Present iff the asset supports EIP-3009 (USDC); null otherwise.
+    Eip3009Submission:
+      type: object
+      description: |
+        EIP-712 `ReceiveWithAuthorization` typed-data fields plus the ECDSA signature
+        parts. `to`, `validBefore` and `nonce` are validated against the order's frozen
+        bindings before relay.
+      required: [from, to, value, valid_after, valid_before, nonce, v, r, s]
+      properties:
+        from: { $ref: '#/components/schemas/EvmAddress' }
+        to:
+          $ref: '#/components/schemas/EvmAddress'
+          # MUST equal the chain's EIP3009PayRouter.
+        value:
+          $ref: '#/components/schemas/Amount'
+          # MUST equal order.expected_amount.
+        valid_after:
+          type: integer
+          format: int64
+          description: Typed-data `validAfter` (normally `0`).
+        valid_before:
+          type: integer
+          format: int64
+          description: MUST equal `order.expires_at` as unix seconds.
+        nonce:
+          $ref: '#/components/schemas/Bytes32'
+          # MUST equal authNonce = keccak256(abi.encode(chainId, salt)).
+        v:
+          type: integer
+          minimum: 27
+          maximum: 28
+        r: { $ref: '#/components/schemas/Bytes32' }
+        s: { $ref: '#/components/schemas/Bytes32' }
+
+    # ------------------------------------------------------------------
+    # SSE payloads
+    # ------------------------------------------------------------------
+    SseFrame:
+      type: object
+      description: |
+        Logical representation of one SSE frame on the wire
+        (`id:` / `event:` / `data:` lines + `retry: 3000`). The stream itself is
+        `text/event-stream`; this schema documents each frame's fields.
+      required: [event, data]
+      properties:
+        id:
+          type: string
+          pattern: '^[0-9]+$'
+          description: Monotonic per-order event id; send back as `Last-Event-ID` to resume.
+        event: { $ref: '#/components/schemas/SseEventType' }
+        data:
+          description: Single-line JSON; schema keyed by `event` (see endpoint docs).
+          oneOf:
+            - $ref: '#/components/schemas/SseSnapshotData'
+            - $ref: '#/components/schemas/SseDepositData'
+            - $ref: '#/components/schemas/SseConfirmationData'
+            - $ref: '#/components/schemas/SseOrderStatusData'
+        retry:
+          type: integer
+          const: 3000
+          description: Milliseconds the client should wait before reconnecting.
+    SseSnapshotData:
+      type: object
+      description: "`data` for `snapshot` — same shape as the public GET."
+      allOf:
+        - $ref: '#/components/schemas/PublicPayment'
+    SseDepositData:
+      type: object
+      description: "`data` for `block_detected`."
+      required: [deposit_id, tx_hash, block_number, amount, asset_symbol, status]
+      properties:
+        deposit_id: { type: string, format: uuid }
+        chain_id: { type: integer, format: int64 }
+        tx_hash: { $ref: '#/components/schemas/TxHash' }
+        log_index: { type: integer }
+        block_number: { type: integer, format: int64 }
+        from_address: { $ref: '#/components/schemas/EvmAddress' }
+        amount: { $ref: '#/components/schemas/Amount' }
+        asset_symbol: { type: string }
+        deposit_category: { $ref: '#/components/schemas/OnchainDepositCategory' }
+        status: { $ref: '#/components/schemas/OnchainDepositStatus' }
+        detected_at: { type: string, format: date-time }
+    SseConfirmationData:
+      type: object
+      description: "`data` for `confirmation_progress`."
+      required: [deposit_id, tx_hash, block_number, current_confirmations, required_confirmations, safe_head_height]
+      properties:
+        deposit_id: { type: string, format: uuid }
+        tx_hash: { $ref: '#/components/schemas/TxHash' }
+        block_number: { type: integer, format: int64 }
+        current_confirmations: { type: integer }
+        required_confirmations: { type: integer }
+        safe_head_height: { type: integer, format: int64 }
+    SseOrderStatusData:
+      type: object
+      description: "`data` for every order-status event."
+      required: [order_id, status, expected_amount, received_amount]
+      properties:
+        order_id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/PaymentOrderStatus' }
+        expected_amount: { $ref: '#/components/schemas/Amount' }
+        received_amount: { $ref: '#/components/schemas/Amount' }
+        tx_hash:
+          anyOf:
+            - $ref: '#/components/schemas/TxHash'
+            - type: "null"
+          # deposit that triggered the transition, if any.
+        expires_at: { type: string, format: date-time }
+        settled_at: { type: ["string", "null"], format: date-time }
+        occurred_at: { type: string, format: date-time }
+
+    # ------------------------------------------------------------------
+    # Admin / ops
+    # ------------------------------------------------------------------
+    TrialBalanceRow:
+      type: object
+      required: [chain_id, asset_symbol, total_debit, total_credit, balanced, all_balances_non_negative]
+      properties:
+        chain_id: { type: integer, format: int64 }
+        asset_symbol: { type: string }
+        total_debit: { $ref: '#/components/schemas/Amount' }
+        total_credit: { $ref: '#/components/schemas/Amount' }
+        balanced:
+          type: boolean
+          description: "`total_debit == total_credit` for this (chain, asset) pair."
+        all_balances_non_negative: { type: boolean }
+    CustodyCheck:
+      type: object
+      required: [check, chain_id, asset_symbol, ledger_account, ledger_balance, onchain_balance, delta, matched, safe_head_height]
+      properties:
+        check: { $ref: '#/components/schemas/CustodyCheckType' }
+        chain_id: { type: integer, format: int64 }
+        asset_symbol:
+          type: string
+          description: Token symbol; `ETH` for `HOT_WALLETS_NATIVE_BALANCE`.
+        ledger_account: { $ref: '#/components/schemas/LedgerAccountType' }
+        ledger_balance: { $ref: '#/components/schemas/Amount' }
+        onchain_balance:
+          $ref: '#/components/schemas/Amount'
+          # measured at safe_head_height.
+        delta:
+          type: string
+          description: Signed decimal string `onchain_balance - ledger_balance`; `"0"` when matched.
+          pattern: '^-?(0|[1-9][0-9]{0,77})$'
+        matched: { type: boolean }
+        safe_head_height: { type: integer, format: int64 }
+    ReconciliationReport:
+      type: object
+      required: [status]
+      properties:
+        run_id: { type: ["string", "null"], format: uuid }
+        trigger: { $ref: '#/components/schemas/ReconciliationTrigger' }
+        status: { $ref: '#/components/schemas/ReconciliationRunStatus' }
+        started_at: { type: ["string", "null"], format: date-time }
+        finished_at: { type: ["string", "null"], format: date-time }
+        trial_balances:
+          type: array
+          description: Layer 1 — per (chain, asset) trial balance + non-negativity.
+          items: { $ref: '#/components/schemas/TrialBalanceRow' }
+        custody_checks:
+          type: array
+          description: Layer 2 — the four on-chain vs ledger snapshot checks.
+          items: { $ref: '#/components/schemas/CustodyCheck' }
+        failures:
+          type: array
+          items: { type: string }
+          description: Human-readable list of violated invariants when `status = FAILED`.
+    OutboundTxAttempt:
+      type: object
+      required: [id, attempt_no, attempt_kind, tx_hash, status]
+      properties:
+        id: { type: string, format: uuid }
+        attempt_no:
+          type: integer
+          description: RBF ladder index (1-based).
+        attempt_kind: { $ref: '#/components/schemas/OutboundAttemptKind' }
+        tx_hash: { $ref: '#/components/schemas/TxHash' }
+        status: { $ref: '#/components/schemas/OutboundTxAttemptStatus' }
+        block_number: { type: ["integer", "null"], format: int64 }
+        block_hash: { type: ["string", "null"] }
+        receipt_status:
+          type: ["integer", "null"]
+          enum: [0, 1, null]
+          description: EVM receipt status once finalized.
+        max_fee_per_gas: { $ref: '#/components/schemas/Amount' }
+        max_priority_fee_per_gas: { $ref: '#/components/schemas/Amount' }
+        gas_used: { type: ["integer", "null"], format: int64 }
+        effective_gas_price:
+          anyOf:
+            - $ref: '#/components/schemas/Amount'
+            - type: "null"
+        broadcasted_at: { type: string, format: date-time }
+    OutboundTxIntent:
+      type: object
+      required: [id, intent_type, chain_id, wallet_address, nonce, status, created_at, attempts]
+      properties:
+        id: { type: string, format: uuid }
+        intent_type: { $ref: '#/components/schemas/OutboundIntentType' }
+        reference_id:
+          type: ["string", "null"]
+          format: uuid
+          description: "`sweep_batches.id` / `merchant_payouts.id` / payment order id per `intent_type`."
+        chain_id: { type: integer, format: int64 }
+        wallet_address: { $ref: '#/components/schemas/EvmAddress' }
+        nonce: { type: integer, format: int64 }
+        status: { $ref: '#/components/schemas/OutboundTxIntentStatus' }
+        created_at: { type: string, format: date-time }
+        attempts:
+          type: array
+          description: Full RBF/dropped/filler history, `attempt_no` ascending.
+          items: { $ref: '#/components/schemas/OutboundTxAttempt' }
+    WalletNonceCursor:
+      type: object
+      required: [chain_id, wallet_address, wallet_role, next_nonce, halted]
+      properties:
+        chain_id: { type: integer, format: int64 }
+        wallet_address: { $ref: '#/components/schemas/EvmAddress' }
+        wallet_role: { $ref: '#/components/schemas/WalletRole' }
+        next_nonce: { type: integer, format: int64 }
+        halted:
+          type: boolean
+          description: Queue paused because an intent sits in `NONCE_STOLEN_HALT`.
+        updated_at: { type: string, format: date-time }
+    OutboundQueueView:
+      type: object
+      required: [nonce_cursors, halted_wallets, data, page]
+      properties:
+        nonce_cursors:
+          type: array
+          items: { $ref: '#/components/schemas/WalletNonceCursor' }
+        halted_wallets:
+          type: array
+          description: (chain, wallet) pairs whose queue is halted by `NONCE_STOLEN_HALT`.
+          items:
+            type: object
+            required: [chain_id, wallet_address, intent_id]
+            properties:
+              chain_id: { type: integer, format: int64 }
+              wallet_address: { $ref: '#/components/schemas/EvmAddress' }
+              intent_id: { type: string, format: uuid }
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/OutboundTxIntent' }
+        page: { $ref: '#/components/schemas/PageInfo' }
+    SignerHealth:
+      type: object
+      required: [reachable]
+      properties:
+        reachable:
+          type: boolean
+          description: mTLS `GetSignerHealth` round-trip succeeded.
+        mtls_ok: { type: boolean }
+        signer_version: { type: string }
+        uptime_seconds: { type: integer, format: int64 }
+        wallets:
+          type: array
+          items:
+            type: object
+            required: [role, address, chain_ids, loaded]
+            properties:
+              role: { $ref: '#/components/schemas/WalletRole' }
+              address: { $ref: '#/components/schemas/EvmAddress' }
+              chain_ids:
+                type: array
+                items: { type: integer, format: int64 }
+              loaded: { type: boolean }
+        circuit_breaker:
+          type: object
+          properties:
+            tripped: { type: boolean }
+            rolling_24h_used: { $ref: '#/components/schemas/Amount' }
+            rolling_24h_limit: { $ref: '#/components/schemas/Amount' }
+        whitelist:
+          type: object
+          properties:
+            active_count: { type: integer }
+            pending_cooldown_count: { type: integer }
+            revoked_count: { type: integer }
+        intent_slots:
+          type: object
+          description: "`signer_intent_slots` occupancy per (chain, wallet)."
+          properties:
+            open_slots: { type: integer }
+            filler_signed_slots: { type: integer }
+        audit_chain:
+          type: object
+          description: Result of the gateway's independent `VerifyAuditChain` patrol.
+          properties:
+            valid: { type: boolean }
+            last_seq: { type: integer, format: int64 }
+            last_entry_hash: { type: string }
+            verified_at: { type: string, format: date-time }
+            verification_interval_seconds: { type: integer, example: 300 }
+    QuarantinedVault:
+      type: object
+      required: [deposit_address_id, chain_id, address, is_quarantined]
+      properties:
+        deposit_address_id: { type: string, format: uuid }
+        chain_id: { type: integer, format: int64 }
+        address: { $ref: '#/components/schemas/EvmAddress' }
+        is_quarantined: { type: boolean }
+        asset_symbol: { type: string }
+        reason:
+          type: string
+          description: e.g. `SWEEP_REVERT_BLACKLISTED`, `SWEEP_REVERT_BALANCE_ANOMALY`.
+        sweep_batch_id: { type: ["string", "null"], format: uuid }
+        sweep_batch_item_id: { type: ["string", "null"], format: uuid }
+        item_status:
+          type: string
+          enum: [PENDING, SWEPT, QUARANTINED_REVERT]
+        related_order_id: { type: ["string", "null"], format: uuid }
+        quarantined_at: { type: ["string", "null"], format: date-time }
+    QuarantinedVaultPage:
+      type: object
+      required: [data, page]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/QuarantinedVault' }
+        page: { $ref: '#/components/schemas/PageInfo' }
+    MerchantFreezeState:
+      type: object
+      required: [merchant_id, payout_frozen, reorg_receivable_balance]
+      properties:
+        merchant_id: { type: string, format: uuid }
+        payout_frozen: { type: boolean }
+        reorg_receivable_balance:
+          $ref: '#/components/schemas/Amount'
+          # live MERCHANT_REORG_RECEIVABLE balance for the merchant.
+        unfrozen_at: { type: ["string", "null"], format: date-time }
+
+    # ------------------------------------------------------------------
+    # Dev simulator
+    # ------------------------------------------------------------------
+    SimStep:
+      type: object
+      required: [seq, name, status]
+      properties:
+        seq: { type: integer }
+        name: { type: string }
+        status:
+          type: string
+          enum: [PENDING, RUNNING, OK, FAILED, SKIPPED]
+        detail: { type: string }
+        tx_hash:
+          anyOf:
+            - $ref: '#/components/schemas/TxHash'
+            - type: "null"
+        at: { type: string, format: date-time }
+    SimRun:
+      type: object
+      required: [run_id, scenario, status, steps, started_at]
+      properties:
+        run_id: { type: string, format: uuid }
+        scenario: { $ref: '#/components/schemas/SimScenario' }
+        status: { $ref: '#/components/schemas/SimRunStatus' }
+        steps:
+          type: array
+          items: { $ref: '#/components/schemas/SimStep' }
+        summary:
+          type: object
+          additionalProperties: true
+          description: Scenario-specific result blob (e.g. orphan heights, quarantined count, rejected-request table).
+        error: { type: ["string", "null"] }
+        started_at: { type: string, format: date-time }
+        finished_at: { type: ["string", "null"], format: date-time }

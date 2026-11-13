@@ -1,0 +1,16 @@
+# VaultFlow Foundry profile — frozen in P0-6.
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+out = "out"
+libs = ["lib"]
+solc_version = "0.8.24"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+# W1 tests read docs/GOLDEN_VECTORS.json via vm.readFile — keep read access on repo docs/.
+fs_permissions = [
+    { access = "read", path = "./" },
+    { access = "read", path = "../docs" },
+]
