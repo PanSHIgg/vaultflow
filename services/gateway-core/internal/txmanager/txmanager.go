@@ -9,7 +9,8 @@
 //     ② Mempool 驱逐 (K>=latest_nonce、全部候选 getTransactionByHash==nil、
 //     pending_nonce<=K) 标 DROPPED → 命中 Signer 幂等槽重签补发 (新 attempt 行);
 //     ③ 在途取消追加同 Nonce GAP_FILLER 候选;
-//     ④ 带外占用熔断 (K<latest_nonce 且本系统全部候选无回执) →
+//     ④ 带外占用熔断 (K<latest_nonce 且本系统全部候选无回执; QUEUED 首播
+//     SendRawTx 失败时以 latest-nonce 探针做零 attempt 等价判定) →
 //     NONCE_STOLEN_HALT 停队列 + 紧急告警.
 //
 // DROPPED 不可复活 — 只能以新 attempt_no 补发; SUPERSEDED→BROADCASTED

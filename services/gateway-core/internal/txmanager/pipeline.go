@@ -348,6 +348,7 @@ func (m *Manager) signBroadcastPersist(ctx context.Context, intent types.Outboun
 	if _, err := m.chain.SendRawTx(ctx, raw); err != nil && !chain.IsAlreadyKnownError(err) {
 		werr := fmt.Errorf("txmanager: broadcast %s: %w", txHash.Hex(), err)
 		m.recordError(ctx, intent.ID, werr)
+		m.haltIfQueuedNonceConsumed(ctx, intent)
 		return werr
 	}
 
@@ -385,6 +386,38 @@ func (m *Manager) signBroadcastPersist(ctx context.Context, intent types.Outboun
 		return werr
 	}
 	return nil
+}
+
+// haltIfQueuedNonceConsumed QUEUED 首播失败后的 §4.2④ 等价判定: SendRawTx 已
+// 失败, 探测链上 latest(mined) nonce — 若 latestNonce > intent.Nonce 则该
+// Nonce 已被 canonical 链消费. QUEUED 意图此刻 outbound_tx_attempts 恒为零行
+// (首行 attempt 仅由本函数下方持久化步骤插入), "消耗非本系统候选"不证自明,
+// 等价于巡检④的 provedEmpty 证据, 直接 haltIntent 熔断停队列.
+// (修复: 此前 QUEUED 意图 nonce 在分配至首播间被带外消耗时, SendRawTx
+// 持续撞 "nonce too low" 无限重试 — WatchdogTick 只扫 IN_FLIGHT, 熔断永不触发.)
+//
+// 严格限定 QUEUED: IN_FLIGHT 重发路径 (RBF 提价 / DROPPED 补发 / GAP_FILLER /
+// §4.3 回滚重广播) 已有自有候选, 必须由 inspectIntent 的 Receipt provedEmpty
+// 核查区分"自有候选入块"与"带外消耗" — 否则自有入块会误触熔断, 巡检仍是唯一
+// 裁定方. 探测本身失败则 fail-open 不熔断 (与 watchdog inconclusive 哲学一致),
+// 意图留 QUEUED 待下轮重试.
+func (m *Manager) haltIfQueuedNonceConsumed(ctx context.Context, intent types.OutboundTxIntent) {
+	if intent.Status != types.IntentQueued {
+		return
+	}
+	latestNonce, err := m.chain.Nonce(ctx, intent.WalletAddress, false)
+	if err != nil {
+		m.log.Warn("queued nonce-consumption probe failed; fail-open retry",
+			zap.String("intent", intent.ID.String()), zap.Error(err))
+		return
+	}
+	if latestNonce <= intent.Nonce {
+		return // Nonce 未被链上消费 — 普通瞬时失败, 常规重试
+	}
+	if err := m.haltIntent(ctx, intent); err != nil {
+		m.log.Warn("halt queued intent failed",
+			zap.String("intent", intent.ID.String()), zap.Error(err))
+	}
 }
 
 // cancelRejectedIntent B6 — 业务载荷被 signer 明确拒签: 该 Nonce 已分配不可

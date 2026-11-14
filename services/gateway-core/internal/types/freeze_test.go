@@ -114,6 +114,7 @@ func TestOrderMachine(t *testing.T) {
 func TestIntentAndAttemptMachines(t *testing.T) {
 	allowed := [][2]TxIntentStatus{
 		{IntentQueued, IntentInFlight},
+		{IntentQueued, IntentNonceStolenHalt},
 		{IntentInFlight, IntentInFlight},
 		{IntentInFlight, IntentNonceStolenHalt},
 		{IntentInFlight, IntentIncludedPendingSafe},

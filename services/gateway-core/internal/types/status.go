@@ -181,7 +181,8 @@ const (
 
 var txIntentTransitions = map[TxIntentStatus]map[TxIntentStatus]bool{
 	IntentQueued: {
-		IntentInFlight: true, // 首笔签名广播
+		IntentInFlight:        true, // 首笔签名广播
+		IntentNonceStolenHalt: true, // 已分配 Nonce 首播前被带外消耗
 	},
 	IntentInFlight: {
 		IntentInFlight:            true, // RBF 提价 / Dropped 补发 / 追加同 Nonce GAP_FILLER

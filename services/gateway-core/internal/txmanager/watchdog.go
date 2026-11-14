@@ -165,11 +165,17 @@ func oldestBroadcast(live []types.OutboundTxAttempt) time.Time {
 
 // haltIntent ④ 私钥带外占用: 意图置 NONCE_STOLEN_HALT, 在播候选标 DROPPED,
 // 该钱包出站队列熔断 (QueueIntent 检查), 触发最高优先级告警.
+// 两个入口:
+//   - 巡检 inspectIntent: IN_FLIGHT 且 K<latest_nonce 且全部候选确定性无回执;
+//   - 首播 haltIfQueuedNonceConsumed: QUEUED 意图的已分配 Nonce 首播前被
+//     带外消耗 (零 attempt 行即"非本系统消耗"等价证明) — 故守卫放宽为
+//     (QUEUED, IN_FLIGHT); QUEUED 行无 BROADCASTED 候选, attempts→DROPPED
+//     更新恒为零行 no-op.
 func (m *Manager) haltIntent(ctx context.Context, it types.OutboundTxIntent) error {
 	err := pgx.BeginFunc(ctx, m.db, func(tx pgx.Tx) error {
 		res, err := tx.Exec(ctx,
 			`UPDATE outbound_tx_intents SET status='NONCE_STOLEN_HALT'
-			  WHERE id=$1 AND status='IN_FLIGHT'`, it.ID)
+			  WHERE id=$1 AND status IN ('QUEUED','IN_FLIGHT')`, it.ID)
 		if err != nil {
 			return err
 		}
