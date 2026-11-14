@@ -46,7 +46,7 @@ contract BatchSweeper {
     PendingRotation public pendingColdWalletRotation;
 
     /// @notice Custody-token registry — rescueAsset MUST refuse these (§2.2.3).
-    ///         TODO(W1): decide population path (deploy config vs setter events).
+    ///         Populated by governance (deploy script marks USDT/USDC).
     mapping(address => bool) public isSupportedCustodyToken;
 
     event VaultSwept(address indexed vault, bytes32 indexed salt, uint256 amount);
@@ -69,13 +69,24 @@ contract BatchSweeper {
         timelock = timelock_;
     }
 
+    /// @dev Stray native ETH may land here; rescuable via rescueAsset(token==0).
+    ///      DepositVault proxies intentionally have NO receive() — a plain ETH
+    ///      send to a vault reverts instead of being trapped forever.
+    receive() external payable {}
+
     /// @notice Deploy (if needed) + sweep up to 50 vaults of one `token` into the
     ///         current cold wallet. Per-item failures are quarantined, never fatal.
+    ///         Zero-`exactAmount` items are NOT swept: they emit
+    ///         `VaultQuarantined(vault, salt, 0)` (off-chain review flag) so the
+    ///         "one terminal event per item" indexer convention still holds —
+    ///         no `VaultSwept(..,0)` is ever emitted (FIX-C).
     /// @dev Two steps per item (§2.2.2):
     ///      1. deploy proxy WITHOUT a gas cap (trusted internal CREATE2);
     ///      2. `sweep{gas: SWEEP_GAS_CAP}` under try/catch — a ReturnBomb/USDT-
     ///         blacklist revert is isolated to that single vault.
-    ///      TODO(W1): emit fields/indexing final review; reentrancy review.
+    ///      Reentrancy: any token-level reenter into this function sees
+    ///      msg.sender == vault != relayerHotWallet and reverts; reentering
+    ///      deployProxy sees msg.sender == vault != sweeper and reverts.
     function deployAndSweepBatch(SweepItem[] calldata items, address token, address targetColdWallet)
         external
     {
@@ -88,16 +99,29 @@ contract BatchSweeper {
             uint256 exactAmount = items[i].exactAmount;
             address vault = IVaultFactory(factory).predictVaultAddress(salt);
 
+            // FIX-C (audit P1): a zero exactAmount must never reach the sweep
+            // boundary — `transfer(0)` succeeds on USDT/USDC and would emit
+            // VaultSwept(..,0), which the indexer's ledger PostEntry refuses
+            // (zero amounts), stalling the settlement loop. The item is
+            // quarantine-flagged instead for off-chain review: every item
+            // still emits EXACTLY ONE terminal event (VaultSwept XOR
+            // VaultQuarantined) and the lazy deploy is skipped until a real
+            // (nonzero) sweep needs the vault.
+            if (exactAmount == 0) {
+                emit VaultQuarantined(vault, salt, 0);
+                continue;
+            }
+
             // Step 1 — deploy on demand, intentionally uncapped (pure CREATE2, no external reentry).
             if (vault.code.length == 0) {
                 IVaultFactory(factory).deployProxy(salt);
             }
 
-            // Step 2 — isolated per-vault sweep under the 120k gas cap.
+            // Step 2 — isolated per-vault sweep under the 120k gas cap. The
+            // vault itself truncates returndata to <=32B at the token boundary.
             try IDepositVault(vault).sweep{gas: SWEEP_GAS_CAP}(token, targetColdWallet, exactAmount) {
                 emit VaultSwept(vault, salt, exactAmount);
             } catch {
-                // TODO(W1): capture bounded revert reason for quarantine forensics.
                 emit VaultQuarantined(vault, salt, exactAmount);
             }
         }
@@ -113,6 +137,7 @@ contract BatchSweeper {
     }
 
     /// @notice Step 2 — execute after the timelock has fully elapsed.
+    /// @dev `initCodeHash` is unaffected (§2.1.3): it only binds `implementation`.
     function executeRelayerRotation() external {
         PendingRotation memory p = pendingRelayerRotation;
         require(p.candidate != address(0), "BatchSweeper: no pending relayer rotation");
@@ -145,7 +170,9 @@ contract BatchSweeper {
     /// @notice Rescue non-custody assets (native ETH via token==address(0), or
     ///         stray non-whitelisted ERC-20). Custody tokens are HARD-excluded in
     ///         code so governance can never drain user deposits (§2.2.3).
-    /// @dev TODO(W1): final review of transfer semantics vs ReturnBomb edge.
+    /// @dev The low-level call is acceptable here: rescue paths are governance-
+    ///      gated, out of the hot path, and non-custody tokens are not the
+    ///      ReturnBomb threat model of the per-vault sweep boundary.
     function rescueAsset(address token, address to, uint256 amount) external {
         require(msg.sender == timelock, "BatchSweeper: caller is not timelock");
         require(to != address(0), "BatchSweeper: zero to");
@@ -165,7 +192,7 @@ contract BatchSweeper {
     }
 
     /// @notice Register/deregister a custody stablecoin (guards rescueAsset).
-    /// @dev TODO(W1): likely called from deploy script / governance; restrict as decided.
+    /// @dev Governance-only; called by the deploy script for USDT/USDC.
     function setSupportedCustodyToken(address token, bool supported) external {
         require(msg.sender == timelock, "BatchSweeper: caller is not timelock");
         isSupportedCustodyToken[token] = supported;

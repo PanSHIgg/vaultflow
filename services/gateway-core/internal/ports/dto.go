@@ -150,7 +150,13 @@ type ReviewOrderRequest struct {
 	// RefundToAddress CREATE_REFUND 必填: 核实后的客户收款地址
 	// (禁止自动退回 tx.from_address, §9.2).
 	RefundToAddress *types.Address
-	OperatorNote    string
+	// RefundTicket CREATE_REFUND 必填: 离线管理员签署的 127B 退款票据
+	// (与 PayoutRequest.RefundTicket 同构). 票据内嵌 payout_uuid(raw16,
+	// 载荷 [99:115]) 即所建 merchant_payouts.id — signer 按
+	// SignTransactionRequest.payout_uuid 逐字节比对, 故 PK 必须等于
+	// 票据内嵌 uuid (FIX-D 修复: 此前恒 nil 致 CUSTOMER_REFUND 必拒签).
+	RefundTicket *RefundTicket
+	OperatorNote string
 }
 
 // PayoutRequest 发起提现/客户退款 (幂等; 走 §5.4 状态机, 申请冻结即记 PAYOUT_FLOW 第一腿).
@@ -165,8 +171,14 @@ type PayoutRequest struct {
 	AssetSymbol    string
 	ToAddress      types.Address
 	Amount         types.U256
+	// PayoutID 客户端幂等锚 (openapi payout_uuid), 入库即 merchant_payouts.id —
+	// 亦即广播时 SignTransactionRequest.payout_uuid 与 outbound_tx_intents.
+	// reference_id. CUSTOMER_REFUND 必须等于 RefundTicket 载荷内嵌 payout_uuid
+	// (不一致即拒); 零值由服务端生成 (审核建单路径自动取票据内嵌值).
+	PayoutID uuid.UUID
 	// RefundTicket CUSTOMER_REFUND 必带 (WITHDRAWAL 置 nil):
-	// 创建时暂存, 广播签名时透传给 vault-signer 自证.
+	// 创建时暂存, 广播签名时透传给 vault-signer 自证. 新建单内嵌
+	// retry_seq 必须为 0 (与 retry_seq 列初值对齐).
 	RefundTicket *RefundTicket
 }
 

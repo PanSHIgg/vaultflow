@@ -24,9 +24,12 @@ type TxManager interface {
 	// DROPPED / INCLUDED_UNSAFE / FINALIZED), 供监控台回放 RBF 历史.
 	ListAttempts(ctx context.Context, intentID uuid.UUID) ([]types.OutboundTxAttempt, error)
 
-	// RequestCancel 对在途意图追加同 Nonce GAP_FILLER 取消候选
-	// (命中 Signer 双字段幂等槽, 不覆盖原业务授权字段). 仅 IN_FLIGHT 可取消,
-	// 其余状态返回 ErrInvalidTransition.
+	// RequestCancel 对意图请求同 Nonce GAP_FILLER 取消
+	// (命中 Signer 双字段幂等槽, 不覆盖原业务授权字段).
+	//   - IN_FLIGHT: 立即追加同 Nonce GAP_FILLER 候选;
+	//   - QUEUED (FIX-E/E2): 首播前打持久标记, 下一轮派发以同 Nonce
+	//     GAP_FILLER 填洞;
+	//   - 其余状态返回 ErrInvalidTransition.
 	RequestCancel(ctx context.Context, intentID uuid.UUID) error
 
 	// NonceCursorStatus 查询热钱包 Nonce 游标与熔断状态 (监控台观测).

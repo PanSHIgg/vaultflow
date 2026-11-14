@@ -10,7 +10,7 @@ license = "MIT"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 tonic-reflection = { version = "0.12", optional = true }
 prost = "0.13"
 prost-types = "0.13"
@@ -30,12 +30,22 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 cfg-if = "1"
+rand = "0.8" # OsRng — AES-GCM envelope nonces only
+# mTLS server stack (must mirror tonic 0.12's feature selection so a single
+# rustls CryptoProvider — ring — is present in the build):
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12", "ring"] }
+rustls-pemfile = "2"
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Memory"] }
+
+[dev-dependencies]
+rcgen = "0.13"   # in-memory test PKI (CA + mTLS leaves)
+tempfile = "3"   # isolated signer DB / cert dirs per test
 
 [build-dependencies]
 tonic-build = "0.12"

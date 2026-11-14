@@ -6,8 +6,10 @@
 //! SQLite state and offline admin Ed25519 proofs — never request metadata.
 
 pub mod audit;
+pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod engine;
 pub mod grpc;
 pub mod kms;
 pub mod policy;

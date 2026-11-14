@@ -185,7 +185,10 @@ paths:
         | `APPROVE_REFUND` | `UNDERPAID_EXPIRED_REVIEW`, `LATE_PAID_REVIEW` | `-> REFUND_IN_PROGRESS` | creates a `CUSTOMER_REFUND` payout freezing `SUSPENSE_REFUNDABLE_LIAB -> PAYOUT_LOCKED_LIAB` (template 8) |
 
         `APPROVE_REFUND` requires the 127-byte admin `RefundTicket` fields
-        (`refund` object). The resulting payout follows the `merchant_payouts`
+        (`refund` object, incl. the ticket-bound `payout_uuid`); the ticket is stored
+        as `merchant_payouts.admin_refund_ticket` and passed to `vault-signer` at
+        broadcast — without it the refund payout can never be signed.
+        The resulting payout follows the `merchant_payouts`
         state machine; the order flips to `REFUNDED` when it reaches `COMPLETED`,
         or back to `LATE_PAID_REVIEW` if the payout is cancelled.
       security:
@@ -231,11 +234,16 @@ paths:
         `merchant_payouts` row in `LOCKED_QUEUED`, then the TxManager allocates a
         persisted nonce and drives it through `outbound_tx_intents`.
 
-        * `payout_uuid` is the client-generated idempotency anchor embedded in
-          signer-facing payloads; `Idempotency-Key` governs HTTP replay.
+        * `payout_uuid` is the client-generated idempotency anchor: it becomes
+          `merchant_payouts.id` and flows into `SignTransactionRequest.payout_uuid`
+          (the signer's `(payout_uuid, retry_seq)` idempotency slot) and
+          `outbound_tx_intents.reference_id`. `Idempotency-Key` governs HTTP replay.
         * `to_address` **must** be a whitelist entry in `ACTIVE` status for this merchant
           and `chain_id` (registered via `POST /v1/withdrawal-addresses`, leased by an
           offline admin Ed25519 signature, past its 24h cooldown, before `valid_until`).
+          The gateway verifies this server-side before freezing funds and rejects with
+          `422 ADDRESS_NOT_WHITELISTED` otherwise; the signer re-enforces the same
+          lease at broadcast time.
         * For `SUSPENSE_*` sources the optional `source_order_id` links the draw-down to
           a specific order for auditability.
         * `409 PAYOUT_FROZEN` is returned while `merchants.payout_frozen = true`
@@ -376,6 +384,9 @@ paths:
         its own clock (`now < expiry`) before signing.
 
         `amount` must equal the ticket's `exact_amount` (full-ticket refund semantics).
+        `payout_uuid` becomes the `merchant_payouts.id` primary key — the exact UUID
+        embedded in the ticket — and `refund_ticket.retry_seq` must be `0` on creation
+        (the row's `retry_seq` starts at `0`; retries re-issue a fresh ticket).
       security:
         - ApiKeyAuth: []
       parameters:
@@ -694,6 +705,17 @@ paths:
         `GET /v1/public/payments/{orderId}` every 3 s (the server sets `retry: 3000`
         to the same cadence). Redis outage transparently degrades fan-out to in-process
         delivery; ordering per `id` is still guaranteed.
+
+        **`id:` allocation** — when Redis is available the per-order id is allocated by
+        a shared `INCR` counter, so it is monotonic across gateway instances and safe
+        as a `Last-Event-ID` resume token no matter which instance served the previous
+        event. During a Redis outage the emitting instance falls back to a high-range
+        instance-local sequence (still numeric); duplicates across instances cannot
+        drop events because brokers de-duplicate on `(instance, seq)`.
+
+        **`expired` is not terminal**: the stream stays open after an `expired` frame
+        because `EXPIRED -> LATE_PAID_REVIEW` is a legal transition; only
+        `refunded` / `reversal_resolved` close it server-side.
       security: []
       parameters:
         - $ref: '#/components/parameters/OrderId'
@@ -701,6 +723,14 @@ paths:
           in: header
           required: false
           description: "Resume token from the last received `id:` field."
+          schema: { type: string, pattern: '^[0-9]+$' }
+        - name: lastEventId
+          in: query
+          required: false
+          description: |
+            Query-string equivalent of `Last-Event-ID` for clients that cannot set
+            request headers (e.g. the browser-native `EventSource`). When both are
+            present the header wins.
           schema: { type: string, pattern: '^[0-9]+$' }
       responses:
         '200':
@@ -1550,14 +1580,23 @@ components:
       type: object
       description: |
         Present when `asset.supports_eip3009` (USDC). Binds the payer's typed data:
-        `to = router_address`, `validBefore = order.expires_at`,
-        `nonce = auth_nonce = keccak256(abi.encode(chainId, salt))`.
+        `to = router_address`, `validBefore = order.expires_at` (mirrored below as
+        `valid_before` — submit it back as unix seconds in
+        `Eip3009Submission.valid_before`), `nonce = auth_nonce =
+        keccak256(abi.encode(chainId, salt))`.
       required: [supported, router_address, auth_nonce]
       properties:
         supported: { type: boolean }
         router_address: { $ref: '#/components/schemas/EvmAddress' }
         auth_nonce: { $ref: '#/components/schemas/Bytes32' }
         token_contract: { $ref: '#/components/schemas/EvmAddress' }
+        valid_before:
+          type: string
+          format: date-time
+          description: |
+            Typed-data `validBefore` upper bound. Always equals `order.expires_at`;
+            the payer MUST echo it as unix seconds in `Eip3009Submission.valid_before`
+            (the server rejects any other value with `SIGNER_REJECTED`-class errors).
     ReviewOrderRequest:
       type: object
       required: [action]
@@ -1587,11 +1626,21 @@ components:
         to_address:
           $ref: '#/components/schemas/EvmAddress'
           # customer destination — NOT whitelist-bound; ticket-authorized instead.
+        payout_uuid:
+          type: string
+          format: uuid
+          description: |
+            The `payout_uuid(16B)` embedded in the signed ticket — it becomes the
+            `merchant_payouts.id` of the created payout (`intent.reference_id` /
+            `SignTransactionRequest.payout_uuid`, all byte-compared by the signer).
+            **Required inside `refund` for `APPROVE_REFUND`** (the ticket cannot be
+            bound without it); inside `refund_ticket` it may be omitted and defaults
+            to the top-level `payout_uuid` — if both are given they MUST be equal.
         retry_seq:
           type: integer
           format: int32
           minimum: 0
-          description: New ticket seq when re-issuing after an on-chain revert consumed the nonce; `0` for first issue.
+          description: New ticket seq when re-issuing after an on-chain revert consumed the nonce; `0` for first issue (creation rejects non-zero).
         expiry_unix:
           type: integer
           format: int64
@@ -1618,14 +1667,17 @@ components:
           # must be an ACTIVE merchant whitelist entry for WITHDRAWAL payouts.
     CreateRefundRequest:
       type: object
-      required: [payout_uuid, source_account, chain_id, asset_symbol, amount]
-      allOf:
-        - required: [refund_ticket]
+      required: [payout_uuid, source_account, chain_id, asset_symbol, amount, refund_ticket]
       properties:
         payout_uuid:
           type: string
           format: uuid
-          description: The `payout_uuid(16B)` embedded in the RefundTicket — idempotency anchor.
+          description: |
+            Client idempotency anchor AND the `payout_uuid(16B)` embedded in the
+            `RefundTicket` — it becomes `merchant_payouts.id` (primary key), which the
+            signer byte-compares against the ticket at broadcast time. Reusing the
+            same `payout_uuid` with an identical request body replays the existing
+            payout; reusing it with a different body returns `409 IDEMPOTENCY_CONFLICT`.
         source_account: { $ref: '#/components/schemas/RefundSourceAccount' }
         source_order_id:
           type: ["string", "null"]
@@ -1874,8 +1926,11 @@ components:
           # MUST equal authNonce = keccak256(abi.encode(chainId, salt)).
         v:
           type: integer
-          minimum: 27
-          maximum: 28
+          enum: [0, 1, 27, 28]
+          description: |
+            ECDSA recovery id. The gateway accepts `27`/`28` or the normalized
+            yParity form `0`/`1`; `0`/`1` is lifted to `27`/`28` before the relay
+            calldata is assembled (contracts expect the `27`-shifted encoding).
         r: { $ref: '#/components/schemas/Bytes32' }
         s: { $ref: '#/components/schemas/Bytes32' }
 
@@ -2014,14 +2069,22 @@ components:
           description: Human-readable list of violated invariants when `status = FAILED`.
     OutboundTxAttempt:
       type: object
-      required: [id, attempt_no, attempt_kind, tx_hash, status]
+      required: [id, attempt_no, attempt_kind, status]
       properties:
         id: { type: string, format: uuid }
         attempt_no:
           type: integer
           description: RBF ladder index (1-based).
         attempt_kind: { $ref: '#/components/schemas/OutboundAttemptKind' }
-        tx_hash: { $ref: '#/components/schemas/TxHash' }
+        tx_hash:
+          anyOf:
+            - $ref: '#/components/schemas/TxHash'
+            - type: "null"
+          description: |
+            Hash of the broadcast candidate transaction. Practically always present
+            once an attempt row exists (a row is only persisted after signing) —
+            `null`/absent is reserved for queued-but-never-broadcast projections;
+            note a `QUEUED` intent simply exposes `attempts: []`.
         status: { $ref: '#/components/schemas/OutboundTxAttemptStatus' }
         block_number: { type: ["integer", "null"], format: int64 }
         block_hash: { type: ["string", "null"] }
@@ -2207,7 +2270,30 @@ components:
         summary:
           type: object
           additionalProperties: true
-          description: Scenario-specific result blob (e.g. orphan heights, quarantined count, rejected-request table).
+          description: |
+            Scenario-specific structured result. Every run includes `chain_id`
+            (uint64). Per-scenario keys emitted by the gateway simulator:
+
+            * `reorg-shallow` / `reorg-deep` — `fork_point_height` (last shared
+              height), `canonical_heights` (heights on the winning fork),
+              `orphan_heights` (heights abandoned by the reorg), plus `depth`,
+              `extra_blocks`, `orphaned_from`, `reorg_to`, `new_head`.
+              `deep` runs exercised via `verify_ledger=true` also assert the LIFO
+              reversal left books balanced (see step `ledger_invariant_check`); the
+              dashboard may render each reversed journal as `lifo_reversals`
+              entries `{height, kind, entries:[{direction, account_type, amount}]}`.
+            * `blacklist-returnbomb` — `intent_id`, `native_delta_wei`
+              (1-wei-accurate gas delta booked to `HOT_WALLET_NATIVE`), `note`.
+              Dashboard-level keys `swept_count`, `quarantined_count`,
+              `quarantined[{address, reason}]`, `gas_settle{gas_used,
+              effective_gas_price, matched_1wei}` describe the full scenario shape.
+            * `signer-penetration` — `rejected_requests[]` (`{name, policy, result,
+              reason}`; each forged request with its signer reject code),
+              `legit_requests[]` (`{name, result, slot}`), `reject_rate` (`"N/M"`),
+              `audit_chain_valid`, `audit_entries`, plus `forged_requests`,
+              `all_rejected`, `reject_table` for raw detail.
+            * `invariant-check` (internal) — `balanced`, `trial_balanced`,
+              `total_debits`, `total_credits`, `chain_diffs`, `violations`.
         error: { type: ["string", "null"] }
         started_at: { type: string, format: date-time }
         finished_at: { type: ["string", "null"], format: date-time }

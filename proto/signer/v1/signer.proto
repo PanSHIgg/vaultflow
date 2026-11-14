@@ -17,6 +17,15 @@ service VaultSignerService {
   // signed_payload 为 69B Ed25519 载荷 (见 Rejection/文档约定):
   //   "VAULTFLOW_ADDR_V1"(17B) || chain_id u64BE(8) || merchant_uuid(16)
   //   || recipient_address(20) || valid_until_unix u64BE(8)
+  // 语义固化 (审计 FIX-C 裁决, 不改 wire):
+  //   * 注册仅校验 Ed25519 有效性——已过期 (valid_until <= now) 的租期载荷
+  //     仍被接受并落审计链 (留痕); 签名时才以 WHITELIST_EXPIRED 拦截。
+  //   * 已吊销 (REVOKED) 条目不得被"同一签名的历史载荷"重放复活: signer 为
+  //     每条目保存全部已接受签名历史, 重放任何旧签名 (含被取代租约) 一律
+  //     以 WHITELIST_REVOKED 拒绝。仅当随附签名为该条目从未见过的全新管理
+  //     员审批 (Ed25519 对同一密钥确定性 => 签名不同即载荷字段已变, 如新
+  //     valid_until) 才允许复活, 且 first_seen_at 重新锚定 -> 新租约重新
+  //     服满 cooldown_secs 冷却期 (§1.2 新审批新冷却)。
   rpc RegisterWithdrawalAddress(RegisterWithdrawalAddressRequest)
       returns (RegisterWithdrawalAddressResponse);
 
@@ -34,6 +43,9 @@ service VaultSignerService {
   // 从创世记录逐条重算 SHA-256 审计哈希链。
   // entry_hash = SHA256(seq || timestamp || action || request_digest
   //                     || decision || reason || prev_hash)
+  // 注意 (FIX-C 固化): 本校验对"尾部截断"不可知——删除末尾记录后剩余链仍
+  // 哈希自洽返回 valid=true。巡检方必须将返回的 tip_hash / entries_checked
+  // 与自身持久化的上次链头比对, 才能发现尾部删除。
   rpc VerifyAuditChain(VerifyAuditChainRequest)
       returns (VerifyAuditChainResponse);
 
@@ -120,6 +132,11 @@ message RevokeWithdrawalAddressResponse {
 //   "VAULTFLOW_REFUND_V1"(19B) || chain_id u64BE(8) || token_address(20)
 //   || to_address(20) || exact_amount_u256(32B BE) || payout_uuid(16)
 //   || retry_seq u32BE(4) || expiry_unix u64BE(8)
+// 语义固化 (FIX-C): 载荷内全部字段 (chain_id / token / to / exact_amount /
+// payout_uuid / retry_seq / expiry) 为唯一权威; signer 将载荷字段与本地
+// 解码的 EIP-1559 transfer(to, amount) 及 tx.to 逐字节比对, 请求体中的同名
+// 字段 (SignTransactionRequest.payout_uuid / retry_seq) 仅作一致性比对,
+// 绝不作为授权依据。
 message RefundTicket {
   bytes signed_payload = 1;   // 127B
   bytes admin_signature = 2;  // Ed25519 64B
@@ -133,7 +150,8 @@ message SignTransactionRequest {
   bytes unsigned_tx = 2;
   // 调用方策略提示 (可省); signer 始终自行推导, 不一致时拒签。
   TxPolicy policy_hint = 3;
-  // PAYOUT 策略必填: 幂等槽绑定的业务单号与重试序号。
+  // PAYOUT 策略必填: 幂等槽绑定的业务单号与重试序号。携带 RefundTicket 时
+  // 此二字段必须与票据载荷内值逐字节一致 (票据为唯一权威, 请求体仅作比对)。
   bytes payout_uuid = 4;  // 16B UUID
   uint32 retry_seq = 5;
   // 客户异常退款时携带 (商户常规提现为空)。

@@ -152,7 +152,7 @@ var OrderTerminalStatuses = map[OrderStatus]bool{
 func (s OrderStatus) IsBusinessTerminal() bool { return OrderTerminalStatuses[s] }
 
 // ---------------------------------------------------------------------------
-// §5.3 出站交易意图状态机 outbound_tx_intents.status (7 态)
+// §5.3 出站交易意图状态机 outbound_tx_intents.status (8 态)
 // ---------------------------------------------------------------------------
 
 // TxIntentStatus 出站交易意图状态.
@@ -173,6 +173,10 @@ const (
 	IntentCancelledByFiller TxIntentStatus = "CANCELLED_BY_FILLER"
 	// IntentNonceStolenHalt 检测到私钥带外消耗该 Nonce: 熔断停机告警.
 	IntentNonceStolenHalt TxIntentStatus = "NONCE_STOLEN_HALT"
+	// IntentRejectedBySigner 业务载荷被 vault-signer 明确拒签且 GAP_FILLER
+	// 兜底亦失败 — 显式终态 (002_intent_payload.sql 已入库; FIX-E/E4 Go 侧
+	// 对齐, 白名单无出边即终态, 该 Nonce 洞需人工处置).
+	IntentRejectedBySigner TxIntentStatus = "REJECTED_BY_SIGNER"
 )
 
 var txIntentTransitions = map[TxIntentStatus]map[TxIntentStatus]bool{

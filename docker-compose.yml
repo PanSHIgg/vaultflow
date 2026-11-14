@@ -1,8 +1,15 @@
 name: vaultflow
 
-# VaultFlow dev orchestration — P0-6 baseline.
-# Wave-2 window I1 adds vault-signer (Rust/mTLS) + gateway-core (Go) service
-# blocks — see commented templates at the bottom.
+# VaultFlow dev orchestration — Wave-2 I1 全栈装配.
+#
+# 一键拉起顺序 (契约: scripts/deploy-and-seed.sh 先行生成全部制品):
+#   bash scripts/deploy-and-seed.sh   # 合约部署 + signer-config + certs + env + 镜像
+#   docker compose up --build -d      # 全部服务健康
+#   curl -sf localhost:8080/healthz
+#
+# anvil-a/anvil-b 使用本地构建镜像 vaultflow-anvil:local
+# (ghcr.io/foundry-rs/foundry 在本环境不可拉取 — deploy 目录由脚本生成,
+# 内含从 WSL foundry 工具链拷贝的 anvil/cast 二进制 + Dockerfile.anvil).
 
 services:
   postgres:
@@ -36,63 +43,116 @@ services:
     restart: unless-stopped
 
   anvil-a: # primary dev chain — chain_id 31337
-    image: ghcr.io/foundry-rs/foundry:latest
+    build:
+      context: deploy
+      dockerfile: Dockerfile.anvil
+    image: vaultflow-anvil:local
     container_name: vaultflow-anvil-a
     entrypoint: ["anvil"]
-    command: ["--host", "0.0.0.0", "--port", "8545", "--chain-id", "31337"]
+    # --state: 链态持久化到 named volume — 重复执行 deploy-and-seed 后
+    # 已部署合约地址可校验复用 (幂等), 无需重部署漂移.
+    command: ["--host", "0.0.0.0", "--port", "8545", "--chain-id", "31337", "--state", "/data/anvil-state.json"]
+    volumes:
+      - anvil-a-data:/data
     ports:
       - "8545:8545"
     healthcheck:
-      test: ["CMD-SHELL", "cast block-number --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1"]
+      # 纯 TCP 探活 (镜像无 curl/cast TLS 依赖; anvil 监听即视为就绪).
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8545'"]
       interval: 5s
-      timeout: 3s
-      retries: 12
+      timeout: 4s
+      retries: 15
     restart: unless-stopped
 
   anvil-b: # secondary dev chain — chain_id 31338
-    image: ghcr.io/foundry-rs/foundry:latest
+    build:
+      context: deploy
+      dockerfile: Dockerfile.anvil
+    image: vaultflow-anvil:local
     container_name: vaultflow-anvil-b
     entrypoint: ["anvil"]
-    command: ["--host", "0.0.0.0", "--port", "8545", "--chain-id", "31338"]
+    command: ["--host", "0.0.0.0", "--port", "8545", "--chain-id", "31338", "--state", "/data/anvil-state.json"]
+    volumes:
+      - anvil-b-data:/data
     ports:
       - "8546:8545" # host 8546 -> container anvil 8545
     healthcheck:
-      test: ["CMD-SHELL", "cast block-number --rpc-url http://127.0.0.1:8545 >/dev/null 2>&1"]
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8545'"]
       interval: 5s
-      timeout: 3s
-      retries: 12
+      timeout: 4s
+      retries: 15
     restart: unless-stopped
 
-  # ---------------------------------------------------------------------------
-  # TODO Wave-2 window I1: vault-signer service (Rust tonic mTLS)
-  # vault-signer:
-  #   build: ./services/vault-signer
-  #   container_name: vaultflow-signer
-  #   volumes:
-  #     - ./certs:/etc/vaultflow/certs:ro   # from scripts/gen-mtls-certs.sh
-  #   expose:
-  #     - "50051"                          # internal mTLS gRPC only
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #
-  # TODO Wave-2 window I1: gateway-core service (Go modular monolith)
-  # gateway-core:
-  #   build: ./services/gateway-core
-  #   container_name: vaultflow-gateway
-  #   environment:
-  #     DATABASE_URL: postgres://vaultflow:vaultflow@postgres:5432/vaultflow
-  #     REDIS_URL: redis://redis:6379
-  #     SIGNER_ADDR: vault-signer:50051
-  #   ports:
-  #     - "8080:8080"
-  #   depends_on:
-  #     postgres: { condition: service_healthy }
-  #     redis:    { condition: service_healthy }
-  #     anvil-a:  { condition: service_started }
-  #     anvil-b:  { condition: service_started }
-  #     vault-signer: { condition: service_started }
-  # ---------------------------------------------------------------------------
+  vault-signer: # Rust mTLS gRPC 签名金库 (进程级隔离)
+    # 官方多阶段构建路径: services/vault-signer/Dockerfile (context=repo root).
+    # 本环境 buildkit 内 cargo registry 拉取不可靠 — deploy-and-seed.sh 在 WSL
+    # 侧 cargo build --release 后生成 deploy/Dockerfile.signer 打包预编译二进制.
+    build:
+      context: deploy
+      dockerfile: Dockerfile.signer
+    image: vaultflow-signer:local
+    container_name: vaultflow-signer
+    environment:
+      VAULT_SIGNER_CONFIG: /etc/vaultflow/signer-config.json
+      RUST_LOG: info
+    volumes:
+      - ./certs:/etc/vaultflow/certs:ro                    # scripts/gen-mtls-certs.sh
+      - ./deploy/signer-config.json:/etc/vaultflow/signer-config.json:ro
+      - ./deploy/signer-data:/var/lib/vault-signer          # sqlite + kek (0600)
+    expose:
+      - "50051" # 仅内网 mTLS, 不对外发布
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/50051'"]
+      interval: 5s
+      timeout: 4s
+      retries: 15
+    restart: unless-stopped
+
+  gateway-core: # Go 模块化单体 (API + indexer + txmanager + sweeper + workers)
+    build:
+      context: services/gateway-core
+      dockerfile: Dockerfile
+    image: vaultflow-gateway:local
+    container_name: vaultflow-gateway
+    env_file:
+      # deploy-and-seed.sh 生成 (含 CHAIN_CONFIG_JSON); required:false 允许
+      # 脚本早期 `compose up postgres anvil-*` 时该文件尚未就绪.
+      - path: deploy/gateway.env
+        required: false
+    environment:
+      DATABASE_URL: postgres://vaultflow:vaultflow@postgres:5432/vaultflow?sslmode=disable
+      REDIS_URL: redis://redis:6379
+      SIGNER_ADDR: vault-signer:50051
+      SIGNER_ID: vault-signer
+      MTLS_CLIENT_CERT: /etc/vaultflow/certs/clients/gateway-core.crt
+      MTLS_CLIENT_KEY: /etc/vaultflow/certs/clients/gateway-core.key
+      MTLS_CA_CERT: /etc/vaultflow/certs/ca/ca.crt
+      MTLS_SERVER_NAME: vault-signer
+      MIGRATIONS_DIR: /app/migrations
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./certs:/etc/vaultflow/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080 && echo -e \"GET /healthz HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" >&3 && grep -q \"\\\"ok\\\"\" <&3'"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      anvil-a:
+        condition: service_healthy
+      anvil-b:
+        condition: service_healthy
+      vault-signer:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   pgdata:
+  anvil-a-data:
+  anvil-b-data:

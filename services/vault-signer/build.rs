@@ -13,7 +13,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[allow(deprecated)] // compile() may be soft-deprecated in favor of compile_protos
     tonic_build::configure()
         .build_server(true)
-        .build_client(false)
+        // Client stubs are also emitted: gateway-core owns the Go client in
+        // production, but our own mTLS integration tests need a Rust client.
+        .build_client(true)
         .compile(&["../../proto/signer/v1/signer.proto"], &["../../proto"])?;
 
     println!("cargo:rerun-if-changed=../../proto/signer/v1/signer.proto");

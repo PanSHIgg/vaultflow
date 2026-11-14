@@ -1,0 +1,4 @@
+FROM debian:bookworm-slim
+COPY anvil /usr/local/bin/anvil
+COPY cast  /usr/local/bin/cast
+ENTRYPOINT ["anvil"]

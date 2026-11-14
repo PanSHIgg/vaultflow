@@ -43,7 +43,7 @@ func (s SweepBatchStatus) CanTransition(to SweepBatchStatus) bool {
 func (s SweepBatchStatus) String() string { return string(s) }
 
 // ---------------------------------------------------------------------------
-// sweep_batch_items.item_status (3 态, §6.3)
+// sweep_batch_items.item_status (4 态, §6.3 + 004_sweep_release.sql)
 // ---------------------------------------------------------------------------
 
 // SweepItemStatus 归集批次单条目状态.
@@ -56,12 +56,16 @@ const (
 	SweepItemSwept SweepItemStatus = "SWEPT"
 	// SweepItemQuarantinedRevert 划转 Revert 被外层捕获 (VaultQuarantined, is_quarantined).
 	SweepItemQuarantinedRevert SweepItemStatus = "QUARANTINED_REVERT"
+	// SweepItemReleased 批次终态失败/派发超时后未结条目作废, 解除对 vault
+	// 精确余额的在途占用 (004_sweep_release.sql; FIX-E/E4 Go 侧对齐, 终态).
+	SweepItemReleased SweepItemStatus = "RELEASED"
 )
 
 var sweepItemTransitions = map[SweepItemStatus]map[SweepItemStatus]bool{
 	SweepItemPending: {
 		SweepItemSwept:             true,
 		SweepItemQuarantinedRevert: true,
+		SweepItemReleased:          true, // 批次 FAILED/过期 -> 未结条目释放 (FIX-B/B2)
 	},
 }
 

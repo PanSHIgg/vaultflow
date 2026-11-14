@@ -1,15 +1,44 @@
-//! vault-signer entry point — process hardening, then (W2-4) the mTLS gRPC server.
+//! vault-signer entry point — process hardening, config load, then the
+//! hot-reloadable mTLS gRPC server.
 
-fn main() -> anyhow::Result<()> {
+use std::net::SocketAddr;
+use std::path::Path;
+use std::time::Duration;
+
+use vault_signer::{config, db, engine::SignerCore, grpc, kms::LocalFileKms};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     harden_process();
     tracing_subscriber::fmt::init();
 
-    tracing::info!("vault-signer skeleton booted — gRPC server lands in W2-4");
-    // TODO(W2-4): open db::open(), build kms::KmsProvider, assemble tonic
-    //             rustls mTLS server (client cert required, 90d rotation
-    //             hot-reload) serving grpc::signer_v1::VaultSignerService.
-    let _ = &vault_signer::grpc::signer_v1::SignTransactionRequest::default; // keep lib linked
-    Ok(())
+    let cfg_path = std::env::var("VAULT_SIGNER_CONFIG")
+        .unwrap_or_else(|_| "signer-config.json".to_string());
+    let cfg = config::load(Path::new(&cfg_path))?;
+    tracing::info!(path = %cfg_path, "config loaded");
+
+    let signer_db = db::open(Path::new(&cfg.db_path))?;
+    let kms = LocalFileKms::from_kek_file(Path::new(&cfg.kek_file))?;
+    let chains = cfg.chain_policies()?;
+    let admin_pubkey = cfg.admin_pubkey()?;
+    let core = SignerCore::new(signer_db, &kms, chains, admin_pubkey)?;
+    tracing::info!(wallets = ?core.loaded_wallets(), "hot wallet DEKs ready");
+
+    let tls = grpc::mtls::ReloadingTls::load(cfg.cert_paths())?;
+    let _reloader = tls.spawn_reloader(Duration::from_secs(
+        cfg.cert_reload_interval_secs.unwrap_or(5),
+    ));
+
+    let addr: SocketAddr = cfg.listen_addr.parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, "vault-signer listening (mTLS)");
+
+    let svc = grpc::service::VaultSignerSvc::new(core);
+    grpc::server::serve(listener, tls, svc, async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutdown signal received");
+    })
+    .await
 }
 
 /// Unix hardening: forbid core dumps and best-effort lock all memory pages so
@@ -28,11 +57,15 @@ fn harden_process() {
     }
 }
 
-/// Windows dev build: degrade gracefully. VirtualLock is applied per-DEK-page
-/// after KMS decryption in W2-1 (process-wide locking is not available).
+/// Windows dev build: degrade gracefully. Individual DEK pages are
+/// VirtualLock'd at decrypt time (see kms::LockedSecret); process-wide locking
+/// is not available on Windows.
 #[cfg(windows)]
 fn harden_process() {
-    // TODO(W2-1): windows_sys::Win32::System::Memory::VirtualLock each decrypted
-    //             key page; release with VirtualUnlock before zeroize-on-drop.
-    eprintln!("vault-signer: WARN windows build — VirtualLock per-key-page pending (W2-1)");
+    eprintln!(
+        "vault-signer: WARN windows dev build — per-key-page VirtualLock via kms::LockedSecret only"
+    );
 }
+
+#[cfg(not(any(unix, windows)))]
+fn harden_process() {}

@@ -1,0 +1,9 @@
+# ubuntu:24.04 = glibc 2.39 — 与 WSL cargo 编译产物所需符号版本匹配.
+FROM ubuntu:24.04
+RUN useradd -r -u 10001 -m vaultsigner
+WORKDIR /var/lib/vault-signer
+COPY vault-signer /usr/local/bin/vault-signer
+ENV VAULT_SIGNER_CONFIG=/etc/vaultflow/signer-config.json
+EXPOSE 50051
+USER vaultsigner
+ENTRYPOINT ["/usr/local/bin/vault-signer"]

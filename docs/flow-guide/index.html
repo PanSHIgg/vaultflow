@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VaultFlow · 资金流全景图 — 付款与归集全链路</title>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#111824; --panel2:#0e141d; --line:#1f2b3a;
+    --txt:#dbe4ee; --dim:#8fa3b8; --faint:#5b6b7d;
+    --blue:#60a5fa; --green:#34d399; --purple:#a78bfa; --orange:#fb923c;
+    --red:#f87171; --teal:#2dd4bf; --gray:#94a3b8; --gold:#fbbf24;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--txt);font-family:"Segoe UI",-apple-system,"Microsoft YaHei",sans-serif;line-height:1.7;padding:40px 20px}
+  .wrap{max-width:1220px;margin:0 auto}
+  h1{font-size:30px;font-weight:700;letter-spacing:.5px}
+  h1 .sub{color:var(--dim);font-size:15px;font-weight:400;display:block;margin-top:8px}
+  h2{font-size:21px;margin:56px 0 6px;color:#fff;display:flex;align-items:center;gap:10px}
+  h2 .tag{font-size:12px;font-weight:600;padding:3px 10px;border-radius:99px;background:#1c2a3d;color:var(--blue);border:1px solid #2a3f58}
+  .lead{color:var(--dim);font-size:14px;margin-bottom:18px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px}
+  code,.mono{font-family:"Cascadia Code",Consolas,monospace;font-size:.92em}
+  code{background:#182230;padding:1px 7px;border-radius:6px;color:var(--teal)}
+
+  /* ---------- 角色表 ---------- */
+  .cast{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px}
+  .cast .col{background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:14px}
+  .cast h3{font-size:14px;margin-bottom:10px;color:var(--dim);letter-spacing:1px}
+  .actor{display:flex;gap:10px;padding:9px 10px;border-radius:9px;margin-bottom:7px;background:#141d29;border-left:3px solid var(--gray)}
+  .actor:last-child{margin-bottom:0}
+  .actor .nm{font-size:13.5px;font-weight:600}
+  .actor .ds{font-size:12px;color:var(--dim);line-height:1.5}
+  .actor .chip{display:inline-block;font-size:10.5px;font-family:Consolas,monospace;background:#0c1420;border:1px solid #24354a;border-radius:5px;padding:0 6px;margin-top:3px;color:var(--gray)}
+  .c-blue{border-color:var(--blue)} .c-blue .chip{color:var(--blue)}
+  .c-green{border-color:var(--green)} .c-green .chip{color:var(--green)}
+  .c-purple{border-color:var(--purple)} .c-purple .chip{color:var(--purple)}
+  .c-orange{border-color:var(--orange)} .c-orange .chip{color:var(--orange)}
+  .c-red{border-color:var(--red)} .c-red .chip{color:var(--red)}
+  .c-teal{border-color:var(--teal)} .c-teal .chip{color:var(--teal)}
+
+  /* ---------- 图 ---------- */
+  svg{width:100%;height:auto;display:block}
+  .lane-label{font-size:13px;fill:var(--faint);letter-spacing:2px;font-weight:700}
+  .box-label{font-size:13.5px;fill:#eaf1f8;font-weight:700}
+  .box-sub{font-size:11px;fill:var(--dim)}
+  .box-sub2{font-size:10.5px;fill:var(--faint);font-family:Consolas,monospace}
+  .step-num{font-size:12px;fill:#0b0f14;font-weight:800;text-anchor:middle}
+  .step-txt{font-size:11.5px;fill:#b8c6d6}
+  .step-txt2{font-size:10.5px;fill:var(--faint)}
+
+  /* ---------- 步骤清单 ---------- */
+  .steps{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:16px}
+  .step{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 14px;display:flex;gap:12px;align-items:flex-start}
+  .step .n{flex:0 0 26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;color:#0b0f14;margin-top:2px}
+  .step .t{font-size:13px}
+  .step .t b{color:#fff}
+  .step .t span{color:var(--dim)}
+  .hl{background:#1a2f22;border-left:3px solid var(--green);padding:10px 14px;border-radius:8px;font-size:13px;color:#bfe9d6;margin-top:14px}
+  .warn{background:#2a1f14;border-left:3px solid var(--gold);padding:10px 14px;border-radius:8px;font-size:13px;color:#e8d9b8;margin-top:14px}
+
+  /* ---------- 速查表 ---------- */
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--line)}
+  th{color:var(--dim);font-weight:600;font-size:12px;letter-spacing:1px;background:var(--panel2)}
+  td .mono{color:var(--teal)}
+  tr:hover td{background:#131c28}
+  .badge{display:inline-block;font-size:11px;padding:1px 8px;border-radius:99px;border:1px solid #2a3f58}
+  @media(max-width:900px){.cast{grid-template-columns:1fr}.steps{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>VaultFlow 资金流全景图
+    <span class="sub">一笔付款 + 一次归集，钱到底经过了谁的手？全程只有 3 个真人地址、6 个合约、6 个服务。</span>
+  </h1>
+
+  <!-- ================= 角色表 ================= -->
+  <h2>登场角色表 <span class="tag">先认人，再看图</span></h2>
+  <p class="lead">颜色在全文统一：<b style="color:var(--blue)">蓝</b>=真人钱包 EOA · <b style="color:var(--green)">绿</b>=链下服务 · <b style="color:var(--purple)">紫</b>=链上合约 · <b style="color:var(--orange)">橙</b>=订单保险箱 · <b style="color:var(--red)">红</b>=安全敏感 · <b style="color:var(--teal)">青</b>=资金终点</p>
+
+  <div class="cast">
+    <div class="col">
+      <h3>① 真人地址（EOA，有私钥）</h3>
+      <div class="actor c-blue"><div><div class="nm">用户钱包 0xUser</div><div class="ds">付款人。私钥在用户自己的 MetaMask / 交易所提币账户里，我们永远接触不到。</div><span class="chip">EOA · 私钥在用户手里 · 自己付 Gas</span></div></div>
+      <div class="actor c-blue"><div><div class="nm">归集热钱包 0xHot</div><div class="ds">公司唯一的链上执行账户，负责发归集交易、替整批 vault 买单 Gas。只放少量 ETH/BNB。</div><span class="chip">EOA · 私钥只在 Rust signer 内存里</span></div></div>
+      <div class="actor c-teal"><div><div class="nm">冷钱包 0xCold</div><div class="ds">资金终点。离线设备或多签，几乎从不主动发交易，只负责“收钱”。</div><span class="chip">EOA/多签 · 私钥离线 · 全网资金沉淀处</span></div></div>
+    </div>
+    <div class="col">
+      <h3>② 链下服务（跑在公司服务器上）</h3>
+      <div class="actor c-green"><div><div class="nm">Next.js 收银台</div><div class="ds">用户看到的付款页：展示地址、金额、二维码、到账状态。</div><span class="chip">前端</span></div></div>
+      <div class="actor c-green"><div><div class="nm">Go 订单服务</div><div class="ds">建单 + <b>离线</b>用 CREATE2 公式算出本单专属充值地址，不发交易、零 Gas。</div><span class="chip">gateway-core</span></div></div>
+      <div class="actor c-green"><div><div class="nm">Go 扫块索引器</div><div class="ds">按区块游标调 <code>eth_getLogs</code> 盯 Transfer 事件，校验 parentHash 防链重组。</div><span class="chip">gateway-core</span></div></div>
+      <div class="actor c-green"><div><div class="nm">Go 复式账本 + Webhook</div><div class="ds">确认数够了才在一个 DB 事务里记账 + 改订单 + 通知商户。</div><span class="chip">gateway-core</span></div></div>
+      <div class="actor c-green"><div><div class="nm">Go 归集调度器</div><div class="ds">定期把余额达标的 vault 攒成一批，构建 calldata 送去签名。</div><span class="chip">gateway-core</span></div></div>
+      <div class="actor c-red"><div><div class="nm">Rust vault-signer</div><div class="ds">全网唯一碰私钥的进程。mTLS gRPC 对内服务，签完立刻清零内存。</div><span class="chip">独立服务 · 信任边界</span></div></div>
+      <div class="actor"><div><div class="nm">PostgreSQL</div><div class="ds">订单、链上事件、复式分录、Nonce 游标的唯一事实源。</div><span class="chip">数据库</span></div></div>
+    </div>
+    <div class="col">
+      <h3>③ 链上合约（部署在 Arbitrum / BSC）</h3>
+      <div class="actor c-purple"><div><div class="nm">USDT / USDC 官方合约 0xToken</div><div class="ds">真正的“账本”。所有余额只是它内部 <code>balances</code> 表里的数字。</div><span class="chip">早就部署好的官方合约</span></div></div>
+      <div class="actor c-purple"><div><div class="nm">VaultFactory 0xFactory</div><div class="ds">CREATE2 工厂：用 salt 把 45 字节代理壳部署到预言地址。</div><span class="chip">我们写的</span></div></div>
+      <div class="actor c-purple"><div><div class="nm">DepositVault Impl 0xImpl</div><div class="ds">保险箱逻辑母版：onlySweeper + sweep() 把代币转给冷钱包。</div><span class="chip">我们写的 · 全链只部署 1 份</span></div></div>
+      <div class="actor c-orange"><div><div class="nm">DepositVault Proxy 0xVault ×N</div><div class="ds">每个订单一个的充值地址。可能还没有代码——先收钱，归集时才激活。</div><span class="chip">45 字节代理壳 · 没有私钥</span></div></div>
+      <div class="actor c-purple"><div><div class="nm">BatchSweeper 0xSweeper</div><div class="ds">归集总管：一笔交易循环激活 + 抽干整批 vault，逐个 try/catch 隔离。</div><span class="chip">我们写的</span></div></div>
+      <div class="actor c-purple"><div><div class="nm">EIP3009PayRouter 0xRouter</div><div class="ds">可选：USDC 免 Gas 收单通道，用户签名、热钱包代付 Gas，钱仍落进 0xVault。</div><span class="chip">我们写的 · 仅 USDC 链适用</span></div></div>
+    </div>
+  </div>
+
+  <!-- ================= 图一：支付链路 ================= -->
+  <h2>图一 · 支付链路 <span class="tag">用户付款 → 给地址 → 转账 → 确认到账</span></h2>
+  <p class="lead">注意两个反直觉点：<b>③ 给地址不发交易</b>（纯离线算出来，成本 0）；<b>⑤ 收款地址此刻链上没代码</b>（余额记在 USDT 合约的表里，不需要接收方存在）。</p>
+
+  <div class="panel">
+    <svg viewBox="0 0 1180 660" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="aB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#60a5fa"/></marker>
+        <marker id="aG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#34d399"/></marker>
+        <marker id="aP" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#a78bfa"/></marker>
+        <marker id="aO" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#fb923c"/></marker>
+        <marker id="aX" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#64748b"/></marker>
+        <marker id="aT" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#2dd4bf"/></marker>
+      </defs>
+
+      <!-- 分隔线 -->
+      <text x="24" y="24" class="lane-label">链下 · 公司服务器（Go / Next.js / PG / Rust）</text>
+      <line x1="20" y1="318" x2="1160" y2="318" stroke="#24354a" stroke-dasharray="8 6"/>
+      <text x="24" y="348" class="lane-label">链上 · Arbitrum / BSC</text>
+
+      <!-- ===== 链下节点 ===== -->
+      <!-- 用户钱包（跨界） -->
+      <rect x="24" y="262" width="150" height="82" rx="10" fill="#12233b" stroke="#60a5fa" stroke-width="1.6"/>
+      <text x="99" y="290" text-anchor="middle" class="box-label">用户钱包</text>
+      <text x="99" y="308" text-anchor="middle" class="box-sub2">0xUser · EOA</text>
+      <text x="99" y="326" text-anchor="middle" class="box-sub">私钥在用户手里</text>
+
+      <!-- 收银台 -->
+      <rect x="250" y="64" width="160" height="66" rx="10" fill="#0f241c" stroke="#34d399" stroke-width="1.4"/>
+      <text x="330" y="92" text-anchor="middle" class="box-label">Next.js 收银台</text>
+      <text x="330" y="112" text-anchor="middle" class="box-sub">展示地址 / 金额 / 二维码</text>
+      <!-- SSE 自循环 -->
+      <path d="M292,64 C292,38 368,38 368,64" fill="none" stroke="#64748b" stroke-dasharray="5 4" marker-end="url(#aX)"/>
+      <text x="330" y="34" text-anchor="middle" class="step-txt2">⑧ 前端轮询/SSE 显示「已到账 ✓」</text>
+
+      <!-- 订单服务 -->
+      <rect x="470" y="64" width="180" height="66" rx="10" fill="#0f241c" stroke="#34d399" stroke-width="1.4"/>
+      <text x="560" y="90" text-anchor="middle" class="box-label">Go 订单服务</text>
+      <text x="560" y="110" text-anchor="middle" class="box-sub">建单 · 离线算 CREATE2 地址</text>
+      <text x="560" y="150" text-anchor="middle" class="step-txt2">salt=hash(orderID) → keccak256(0xff‖factory‖salt‖initCode)</text>
+
+      <!-- PG -->
+      <rect x="720" y="64" width="160" height="66" rx="10" fill="#161c26" stroke="#3a4a5e" stroke-width="1.4"/>
+      <text x="800" y="92" text-anchor="middle" class="box-label">PostgreSQL</text>
+      <text x="800" y="112" text-anchor="middle" class="box-sub">订单 · 事件 · 账本 · 游标</text>
+
+      <!-- 索引器 -->
+      <rect x="470" y="196" width="180" height="66" rx="10" fill="#0f241c" stroke="#34d399" stroke-width="1.4"/>
+      <text x="560" y="222" text-anchor="middle" class="box-label">Go 扫块索引器</text>
+      <text x="560" y="242" text-anchor="middle" class="box-sub">eth_getLogs · parentHash 防重组</text>
+
+      <!-- 账本 -->
+      <rect x="720" y="196" width="170" height="66" rx="10" fill="#0f241c" stroke="#34d399" stroke-width="1.4"/>
+      <text x="805" y="222" text-anchor="middle" class="box-label">复式账本 + Outbox</text>
+      <text x="805" y="242" text-anchor="middle" class="box-sub">单事务：分录 + 改单 + webhook</text>
+
+      <!-- 商户 -->
+      <rect x="960" y="196" width="160" height="66" rx="10" fill="#161c26" stroke="#3a4a5e" stroke-width="1.4"/>
+      <text x="1040" y="222" text-anchor="middle" class="box-label">商户后台</text>
+      <text x="1040" y="242" text-anchor="middle" class="box-sub">收 webhook → 发货/放行</text>
+
+      <!-- ===== 链上节点 ===== -->
+      <rect x="250" y="420" width="190" height="86" rx="10" fill="#1d1633" stroke="#a78bfa" stroke-width="1.6"/>
+      <text x="345" y="448" text-anchor="middle" class="box-label">USDT / USDC 合约</text>
+      <text x="345" y="468" text-anchor="middle" class="box-sub2">0xToken · 官方早已部署</text>
+      <text x="345" y="488" text-anchor="middle" class="box-sub">所有人的余额都在它的表里</text>
+
+      <rect x="520" y="420" width="210" height="86" rx="10" fill="#2a1c10" stroke="#fb923c" stroke-width="1.6" stroke-dasharray="7 4"/>
+      <text x="625" y="448" text-anchor="middle" class="box-label">本订单充值地址 0xVault</text>
+      <text x="625" y="468" text-anchor="middle" class="box-sub2">CREATE2 预言地址 · 无私钥</text>
+      <text x="625" y="488" text-anchor="middle" class="box-sub" fill="#fb923c">⚠ 此刻链上还没有代码，照样能收钱</text>
+
+      <rect x="790" y="436" width="170" height="56" rx="10" fill="#131a24" stroke="#2a3f58" stroke-dasharray="4 4"/>
+      <text x="875" y="460" text-anchor="middle" class="box-sub">0xVault₂ · 0xVault₃ · …</text>
+      <text x="875" y="478" text-anchor="middle" class="box-sub2">其他订单的地址（同样未部署）</text>
+
+      <!-- ===== 箭头 ===== -->
+      <!-- ① 用户→收银台 -->
+      <path d="M120,262 C150,200 210,150 258,128" fill="none" stroke="#60a5fa" stroke-width="1.8" marker-end="url(#aB)"/>
+      <circle cx="176" cy="188" r="11" fill="#60a5fa"/><text x="176" y="192" class="step-num">1</text>
+      <text x="186" y="182" class="step-txt">点击「支付 100 USDT」</text>
+
+      <!-- ② 收银台→订单服务 -->
+      <line x1="410" y1="97" x2="464" y2="97" stroke="#34d399" stroke-width="1.8" marker-end="url(#aG)"/>
+      <circle cx="437" cy="80" r="11" fill="#34d399"/><text x="437" y="84" class="step-num">2</text>
+      <text x="437" y="76" text-anchor="middle" class="step-txt2">POST /orders（幂等键）</text>
+
+      <!-- ③ 订单服务→PG -->
+      <line x1="650" y1="97" x2="714" y2="97" stroke="#34d399" stroke-width="1.8" marker-end="url(#aG)"/>
+      <circle cx="683" cy="80" r="11" fill="#34d399"/><text x="683" y="84" class="step-num">3</text>
+      <text x="683" y="76" text-anchor="middle" class="step-txt2">落订单 · 0 笔交易 0 Gas</text>
+
+      <!-- ④ 订单服务→用户（虚线返回） -->
+      <path d="M500,130 C420,220 220,250 172,278" fill="none" stroke="#64748b" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#aX)"/>
+      <circle cx="330" cy="214" r="11" fill="#64748b"/><text x="330" y="218" class="step-num">4</text>
+      <text x="342" y="210" class="step-txt">返回 0xVault 地址 + 金额 + 二维码</text>
+
+      <!-- ⑤ 用户→USDT合约 -->
+      <path d="M130,344 C160,390 200,412 244,432" fill="none" stroke="#60a5fa" stroke-width="1.8" marker-end="url(#aB)"/>
+      <circle cx="184" cy="398" r="11" fill="#60a5fa"/><text x="184" y="402" class="step-num">5</text>
+      <text x="140" y="420" class="step-txt">USDT.transfer(0xVault, 100)</text>
+      <text x="140" y="436" class="step-txt2">普通 ERC-20 转账 · 用户自己付 Gas</text>
+
+      <!-- ⑥a USDT→Vault 内部记账 -->
+      <line x1="440" y1="463" x2="514" y2="463" stroke="#a78bfa" stroke-width="1.8" stroke-dasharray="6 4" marker-end="url(#aP)"/>
+      <circle cx="478" cy="446" r="11" fill="#a78bfa"/><text x="478" y="450" class="step-num">6</text>
+      <text x="478" y="442" text-anchor="middle" class="step-txt2">balances[0xVault] += 100</text>
+
+      <!-- ⑥b USDT→索引器 事件 -->
+      <path d="M360,420 C400,340 460,290 505,262" fill="none" stroke="#a78bfa" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#aP)"/>
+      <text x="400" y="340" class="step-txt">Transfer 事件 → 被扫块器捕获</text>
+      <text x="400" y="356" class="step-txt2">唯一入账依据：Transfer(to==0xVault)</text>
+
+      <!-- ⑦ 索引器→账本 -->
+      <line x1="650" y1="229" x2="714" y2="229" stroke="#34d399" stroke-width="1.8" marker-end="url(#aG)"/>
+      <circle cx="683" cy="212" r="11" fill="#34d399"/><text x="683" y="216" class="step-num">7</text>
+      <text x="683" y="208" text-anchor="middle" class="step-txt2">达到 N 确认 / safe head</text>
+
+      <!-- ⑧ 账本→商户 -->
+      <line x1="890" y1="229" x2="954" y2="229" stroke="#34d399" stroke-width="1.8" marker-end="url(#aG)"/>
+      <circle cx="923" cy="212" r="11" fill="#34d399"/><text x="923" y="216" class="step-num">8</text>
+      <text x="923" y="208" text-anchor="middle" class="step-txt2">webhook 通知发货</text>
+    </svg>
+
+    <div class="steps">
+      <div class="step"><div class="n" style="background:var(--blue)">1</div><div class="t"><b>用户发起付款。</b><span>在收银台选币种和链（Arbitrum 或 BSC），点支付。</span></div></div>
+      <div class="step"><div class="n" style="background:var(--green)">2</div><div class="t"><b>前端 → Go 订单服务。</b><span>携带商户幂等键防重复下单。</span></div></div>
+      <div class="step"><div class="n" style="background:var(--green)">3</div><div class="t"><b>离线算出充值地址。</b><span>用 CREATE2 公式纯数学推导出 0xVault，写库即返回——<b>不发任何链上交易，成本为 0</b>。</span></div></div>
+      <div class="step"><div class="n" style="background:var(--gray)">4</div><div class="t"><b>地址给用户。</b><span>前端显示 0xVault + 应付金额 + 二维码，订单进入 AWAITING_PAYMENT。</span></div></div>
+      <div class="step"><div class="n" style="background:var(--blue)">5</div><div class="t"><b>用户转账。</b><span>从任何钱包/交易所提币都行——只是一笔普通 ERC-20 transfer，<b>用户自己付 Gas</b>。</span></div></div>
+      <div class="step"><div class="n" style="background:var(--purple)">6</div><div class="t"><b>钱"到"了，但地址上没代码。</b><span>USDT 合约只是在它内部的 balances 表里给 0xVault 记了 +100。0xVault 不需要代码、不需要私钥就已经"持有"这笔钱。</span></div></div>
+      <div class="step"><div class="n" style="background:var(--green)">7</div><div class="t"><b>索引器确认到账。</b><span>扫到 Transfer 事件→落库→每出新块校验 parentHash 防重组→达到 N 确认（L2 按 safe head）。</span></div></div>
+      <div class="step"><div class="n" style="background:var(--green)">8</div><div class="t"><b>单事务入账 + 通知。</b><span>一个 PG 事务里：写复式分录、订单→PAID、插 webhook outbox——三件事原子完成，绝不可能钱记了商户不知道。</span></div></div>
+    </div>
+
+    <div class="hl">此时资金的物理位置：静静躺在 USDT 合约的 <code>balances[0xVault]</code> 里。没人能动它——除了将来被 BatchSweeper 激活的保险箱代码自己。</div>
+    <div class="warn">USDC 链上还有一条旁路：用户没 ETH 付 Gas 时，可走 EIP3009PayRouter——用户离线签名、热钱包代付 Gas 提交 <code>receiveWithAuthorization</code>，USDC 在同一笔交易里被路由进 0xVault。对索引器来说完全透明：它只认 Transfer(to=0xVault)，不关心钱怎么来的。</div>
+  </div>
+
+  <!-- ================= 图二：归集链路 ================= -->
+  <h2>图二 · 归集链路 <span class="tag">N 个 vault 的散钱 → 1 笔交易 → 冷钱包</span></h2>
+  <p class="lead">全程只有 <b>1 笔链上交易</b>，Gas 全由热钱包 0xHot 一个地址掏。20 个收款地址从头到尾没有私钥、没有 ETH、没有发过交易。</p>
+
+  <div class="panel">
+    <svg viewBox="0 0 1180 700" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="bB" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#60a5fa"/></marker>
+        <marker id="bG" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#34d399"/></marker>
+        <marker id="bP" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#a78bfa"/></marker>
+        <marker id="bO" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#fb923c"/></marker>
+        <marker id="bR" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#f87171"/></marker>
+        <marker id="bX" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#64748b"/></marker>
+        <marker id="bT" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="#2dd4bf"/></marker>
+      </defs>
+
+      <text x="24" y="24" class="lane-label">链下 · 公司服务器</text>
+      <line x1="20" y1="286" x2="1160" y2="286" stroke="#24354a" stroke-dasharray="8 6"/>
+      <text x="24" y="316" class="lane-label">链上 · Arbitrum / BSC（这整条交易内部发生的一切，Gas 只由 0xHot 付一次）</text>
+
+      <!-- ===== 链下 ===== -->
+      <rect x="60" y="60" width="190" height="70" rx="10" fill="#0f241c" stroke="#34d399" stroke-width="1.4"/>
+      <text x="155" y="88" text-anchor="middle" class="box-label">Go 归集调度器</text>
+      <text x="155" y="108" text-anchor="middle" class="box-sub">选余额达标的 vault 攒批</text>
+
+      <rect x="60" y="176" width="190" height="56" rx="10" fill="#161c26" stroke="#3a4a5e" stroke-width="1.4"/>
+      <text x="155" y="199" text-anchor="middle" class="box-sub">PostgreSQL</text>
+      <text x="155" y="217" text-anchor="middle" class="box-sub2">待归集列表 → 批次状态机</text>
+
+      <rect x="340" y="56" width="210" height="82" rx="10" fill="#2a1216" stroke="#f87171" stroke-width="1.8"/>
+      <text x="445" y="82" text-anchor="middle" class="box-label">Rust vault-signer</text>
+      <text x="445" y="102" text-anchor="middle" class="box-sub">mTLS gRPC · 唯一持 0xHot 私钥</text>
+      <text x="445" y="120" text-anchor="middle" class="box-sub2">签完 zeroize 清零内存</text>
+      <text x="445" y="158" text-anchor="middle" class="step-txt">③ 校验策略：收款方必须 == 0xCold ✓</text>
+      <text x="445" y="174" text-anchor="middle" class="step-txt">目标合约必须在白名单 ✓ → 才肯签名</text>
+
+      <rect x="880" y="60" width="230" height="70" rx="10" fill="#0f241c" stroke="#34d399" stroke-width="1.4"/>
+      <text x="995" y="88" text-anchor="middle" class="box-label">Go 扫块索引器 + 复式账本</text>
+      <text x="995" y="108" text-anchor="middle" class="box-sub">确认批次上链 · 记 Gas 成本账</text>
+
+      <!-- ===== 链上 ===== -->
+      <rect x="60" y="340" width="170" height="76" rx="10" fill="#12233b" stroke="#60a5fa" stroke-width="1.6"/>
+      <text x="145" y="368" text-anchor="middle" class="box-label">归集热钱包</text>
+      <text x="145" y="388" text-anchor="middle" class="box-sub2">0xHot · EOA</text>
+      <text x="145" y="404" text-anchor="middle" class="box-sub">掏整笔交易全部 Gas</text>
+
+      <rect x="340" y="380" width="190" height="86" rx="10" fill="#1d1633" stroke="#a78bfa" stroke-width="1.6"/>
+      <text x="435" y="408" text-anchor="middle" class="box-label">BatchSweeper 合约</text>
+      <text x="435" y="428" text-anchor="middle" class="box-sub2">0xSweeper</text>
+      <text x="435" y="446" text-anchor="middle" class="box-sub">for 循环逐个 vault 处理</text>
+
+      <rect x="60" y="500" width="180" height="70" rx="10" fill="#1d1633" stroke="#a78bfa" stroke-width="1.4"/>
+      <text x="150" y="528" text-anchor="middle" class="box-label">VaultFactory</text>
+      <text x="150" y="548" text-anchor="middle" class="box-sub2">CREATE2 部署 45 字节代理壳</text>
+
+      <!-- vault 列表 -->
+      <rect x="640" y="356" width="200" height="58" rx="10" fill="#2a1c10" stroke="#fb923c" stroke-width="1.4"/>
+      <text x="740" y="380" text-anchor="middle" class="box-label">0xVault₁（已收 100U）</text>
+      <text x="740" y="398" text-anchor="middle" class="box-sub2">本次交易里刚被部署激活</text>
+      <rect x="640" y="428" width="200" height="58" rx="10" fill="#2a1c10" stroke="#fb923c" stroke-width="1.4"/>
+      <text x="740" y="452" text-anchor="middle" class="box-label">0xVault₂（已收 250U）</text>
+      <text x="740" y="470" text-anchor="middle" class="box-sub2">早就部署过 → 直接 sweep</text>
+      <rect x="640" y="500" width="200" height="58" rx="10" fill="#2a1010" stroke="#f87171" stroke-width="1.4" stroke-dasharray="5 4"/>
+      <text x="740" y="524" text-anchor="middle" class="box-label">0xVault₃（被 USDT 拉黑）</text>
+      <text x="740" y="542" text-anchor="middle" class="box-sub2">try/catch 跳过 → QUARANTINED</text>
+
+      <rect x="920" y="400" width="180" height="80" rx="10" fill="#1d1633" stroke="#a78bfa" stroke-width="1.6"/>
+      <text x="1010" y="428" text-anchor="middle" class="box-label">USDT / USDC 合约</text>
+      <text x="1010" y="448" text-anchor="middle" class="box-sub2">0xToken</text>
+      <text x="1010" y="466" text-anchor="middle" class="box-sub">它眼里转账人是 vault 自己</text>
+
+      <rect x="920" y="560" width="200" height="70" rx="10" fill="#0d2b28" stroke="#2dd4bf" stroke-width="1.8"/>
+      <text x="1020" y="588" text-anchor="middle" class="box-label">冷钱包 0xCold</text>
+      <text x="1020" y="608" text-anchor="middle" class="box-sub">资金终点 · 私钥离线/多签</text>
+
+      <!-- ===== 箭头 ===== -->
+      <!-- ① 调度器读PG -->
+      <line x1="155" y1="130" x2="155" y2="170" stroke="#34d399" stroke-width="1.6" marker-end="url(#bG)"/>
+      <circle cx="172" cy="152" r="11" fill="#34d399"/><text x="172" y="156" class="step-num">1</text>
+      <text x="186" y="150" class="step-txt">选出 20 个待归集 vault</text>
+      <text x="186" y="166" class="step-txt2">构建 sweepBatch calldata</text>
+
+      <!-- ② 调度器→signer -->
+      <line x1="250" y1="97" x2="334" y2="97" stroke="#34d399" stroke-width="1.8" marker-end="url(#bG)"/>
+      <circle cx="293" cy="80" r="11" fill="#34d399"/><text x="293" y="84" class="step-num">2</text>
+      <text x="293" y="76" text-anchor="middle" class="step-txt2">mTLS gRPC 请求签名</text>
+
+      <!-- ④ signer→热钱包 -->
+      <path d="M400,138 C320,220 220,290 165,334" fill="none" stroke="#f87171" stroke-width="1.8" marker-end="url(#bR)"/>
+      <circle cx="276" cy="238" r="11" fill="#f87171"/><text x="276" y="242" class="step-num">4</text>
+      <text x="288" y="234" class="step-txt">返回签名 → 广播 1 笔交易</text>
+      <text x="288" y="250" class="step-txt2">Go 全程没见过私钥</text>
+
+      <!-- ⑤ 热钱包→Sweeper -->
+      <line x1="230" y1="388" x2="334" y2="412" stroke="#60a5fa" stroke-width="1.8" marker-end="url(#bB)"/>
+      <circle cx="283" cy="384" r="11" fill="#60a5fa"/><text x="283" y="388" class="step-num">5</text>
+      <text x="238" y="436" class="step-txt2">sweeper.sweepBatch(vaults, token, 0xCold)</text>
+
+      <!-- ⑥ Sweeper→Factory -->
+      <path d="M350,466 C300,490 250,505 236,512" fill="none" stroke="#a78bfa" stroke-width="1.6" marker-end="url(#bP)"/>
+      <circle cx="296" cy="492" r="11" fill="#a78bfa"/><text x="296" y="496" class="step-num">6</text>
+      <text x="246" y="478" class="step-txt2">未部署？先 CREATE2 激活</text>
+
+      <!-- Factory→Vault1 虚线部署 -->
+      <path d="M240,508 C360,470 520,420 634,398" fill="none" stroke="#a78bfa" stroke-width="1.3" stroke-dasharray="5 4" marker-end="url(#bP)"/>
+      <text x="420" y="474" class="step-txt2">deploy(salt₁) → 地址 == 预言的 0xVault₁</text>
+
+      <!-- ⑦ Sweeper→vaults -->
+      <line x1="530" y1="398" x2="634" y2="388" stroke="#fb923c" stroke-width="1.8" marker-end="url(#bO)"/>
+      <line x1="530" y1="426" x2="634" y2="456" stroke="#fb923c" stroke-width="1.8" marker-end="url(#bO)"/>
+      <line x1="530" y1="452" x2="634" y2="524" stroke="#fb923c" stroke-width="1.5" marker-end="url(#bO)"/>
+      <circle cx="584" cy="408" r="11" fill="#fb923c"/><text x="584" y="412" class="step-num">7</text>
+      <text x="560" y="396" class="step-txt2">vault.sweep(USDT → 0xCold)</text>
+      <text x="560" y="368" class="step-txt2">delegatecall → Impl 校验 onlySweeper</text>
+
+      <!-- ⑧ vaults→USDT -->
+      <line x1="840" y1="390" x2="914" y2="424" stroke="#fb923c" stroke-width="1.8" marker-end="url(#bO)"/>
+      <line x1="840" y1="456" x2="914" y2="444" stroke="#fb923c" stroke-width="1.8" marker-end="url(#bO)"/>
+      <line x1="840" y1="530" x2="914" y2="472" stroke="#f87171" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#bR)"/>
+      <circle cx="880" cy="394" r="11" fill="#fb923c"/><text x="880" y="398" class="step-num">8</text>
+      <text x="852" y="384" class="step-txt2">USDT.transfer(0xCold, 全额)</text>
+      <text x="868" y="524" class="step-txt2" fill="#f87171">✗ 拉黑 → revert → catch 跳过</text>
+
+      <!-- ⑨ USDT→Cold -->
+      <line x1="1010" y1="480" x2="1010" y2="554" stroke="#2dd4bf" stroke-width="2" marker-end="url(#bT)"/>
+      <circle cx="1030" cy="516" r="11" fill="#2dd4bf"/><text x="1030" y="520" class="step-num">9</text>
+      <text x="1044" y="512" class="step-txt">balances[0xCold] += 全部</text>
+      <text x="1044" y="528" class="step-txt2">Transfer(vault→0xCold) 事件</text>
+
+      <!-- ⑨b USDT→索引器 确认 -->
+      <path d="M1050,400 C1090,320 1080,220 1040,134" fill="none" stroke="#64748b" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#bX)"/>
+      <text x="1080" y="260" class="step-txt2" transform="rotate(90 1080 260)"></text>
+      <text x="1086" y="300" class="step-txt2">索引器确认批次 INCLUDED → 记 Gas 分录</text>
+    </svg>
+
+    <div class="steps">
+      <div class="step"><div class="n" style="background:var(--green)">1</div><div class="t"><b>调度器攒批。</b><span>从 PG 查出余额 ≥ 阈值、未隔离的 vault（比如 20 个），构建 <code>sweepBatch</code> 的 calldata。</span></div></div>
+      <div class="step"><div class="n" style="background:var(--green)">2</div><div class="t"><b>送去签名。</b><span>通过 mTLS gRPC 把 calldata 发给 Rust vault-signer。Go 自始至终不接触私钥。</span></div></div>
+      <div class="step"><div class="n" style="background:var(--red)">3</div><div class="t"><b>Signer 策略校验（关键防线）。</b><span>解码 calldata，确认归集目标严格等于 0xCold、调用的合约在白名单内、金额在限额内——哪怕 Go 被攻破伪造请求，钱也只会流向冷钱包。通过才用 0xHot 私钥签名。</span></div></div>
+      <div class="step"><div class="n" style="background:var(--red)">4</div><div class="t"><b>广播唯一 1 笔交易。</b><span>0xHot 发出，整笔交易的 Gas 由它一个地址买单（这就是"免垫付"的全部秘密）。</span></div></div>
+      <div class="step"><div class="n" style="background:var(--blue)">5</div><div class="t"><b>调用 BatchSweeper。</b><span>calldata 里带着 vault 地址列表、代币、归集目标。</span></div></div>
+      <div class="step"><div class="n" style="background:var(--purple)">6</div><div class="t"><b>缺代码的地址就地激活。</b><span>Sweeper 让 Factory 用 CREATE2 在该地址部署 45 字节代理壳——CREATE2 保证部署出来的地址和当初预言的分毫不差。</span></div></div>
+      <div class="step"><div class="n" style="background:var(--orange)">7</div><div class="t"><b>逐个调 vault.sweep()。</b><span>代理壳 delegatecall 到 Impl，Impl 验明 <code>msg.sender == 0xSweeper</code> 后执行转账。已部署过的 vault 直接调，跳过部署步骤。</span></div></div>
+      <div class="step"><div class="n" style="background:var(--orange)">8</div><div class="t"><b>USDT 合约执行转账。</b><span>它看到的 msg.sender 是 vault 自己——余额够就放行，钱直达 0xCold。被 USDT 拉黑的地址这一步 revert，被 try/catch 单独隔离，不影响其余 19 个。</span></div></div>
+      <div class="step"><div class="n" style="background:var(--teal)">9</div><div class="t"><b>落账收尾。</b><span>索引器扫到 Transfer(vault→0xCold) 事件→批次→INCLUDED→账本同时记一笔 Gas 成本分录（ETH/BNB 也是资产，不能只记 USDT）。</span></div></div>
+    </div>
+
+    <div class="hl">对比传统 EOA 方案收 20 个地址 = 20 笔打 Gas + 20 笔归集 = <b>40 笔交易</b> + 一地 ETH 粉尘 + 20 个私钥；本方案 = <b>1 笔交易</b> + 0 粉尘 + 0 个充值私钥。</div>
+  </div>
+
+  <!-- ================= 速查表 ================= -->
+  <h2>速查表 <span class="tag">面试时按这张表讲，滴水不漏</span></h2>
+  <div class="panel">
+    <table>
+      <tr><th>名字</th><th>类型</th><th>私钥在哪</th><th>谁给它付 Gas</th><th>里面装什么</th></tr>
+      <tr><td class="mono">0xUser</td><td>EOA</td><td>用户自己的钱包</td><td>用户自己</td><td>用户的 USDT + 一点 ETH/BNB</td></tr>
+      <tr><td class="mono">0xVault ×N</td><td>合约地址（常无代码）</td><td><b style="color:var(--orange)">不存在私钥</b></td><td>从不发交易，不需要 Gas</td><td>单个订单已付的 USDT</td></tr>
+      <tr><td class="mono">0xHot</td><td>EOA</td><td>Rust signer 内存（签完即清）</td><td>自己（归集时统一买单）</td><td>少量 Gas 币，不放资金</td></tr>
+      <tr><td class="mono">0xCold</td><td>EOA / 多签</td><td>离线设备</td><td>几乎不发交易</td><td><b>全部已归集资金</b></td></tr>
+      <tr><td class="mono">0xToken</td><td>官方合约</td><td>—</td><td>—</td><td>全网用户的 balances 总账</td></tr>
+      <tr><td class="mono">0xFactory / 0xImpl / 0xSweeper / 0xRouter</td><td>我方合约</td><td>合约无私钥概念</td><td>只在被调用时消耗调用者的 Gas</td><td>逻辑代码，不沉淀资金（Sweeper/Router 不过夜）</td></tr>
+    </table>
+  </div>
+
+  <div class="panel" style="margin-top:24px">
+    <h2 style="margin-top:0">一句话总结</h2>
+    <p style="font-size:15px;color:var(--txt)">钱的流向永远是一条单行道：<code style="color:var(--blue)">0xUser</code> → <code style="color:var(--orange)">0xVault</code>（无私钥保险箱）→ <code style="color:var(--teal)">0xCold</code>（离线金库）。<br>
+    私钥只存在于两个地方：<b>用户自己手里</b> 和 <b>Rust signer 的内存里</b>。<br>
+    Gas 只由两种人付：<b>用户付自己那笔转账</b>、<b>0xHot 付整批归集那一笔</b>。<br>
+    中间所有服务（订单、索引、账本、调度）碰的都是<b>数据和签名请求</b>，从来不是私钥，也从来不是钱本身——钱从头到尾只在链上合约的 balances 表里移动。</p>
+  </div>
+
+</div>
+</body>
+</html>
