@@ -124,7 +124,14 @@ func (s *Server) merchantAuth(next http.Handler) http.Handler {
 	})
 }
 
-// adminAuth Bearer JWT (HS256, sub 必填) -> ctx admin subject.
+// adminJWT 签发面契约: 固定 iss/aud + 强制 exp — 阻断跨系统令牌串用
+// 与无期限令牌; minter 侧常量须与本文件一致 (e2e-lib.mjs / run-all.sh).
+const (
+	adminJWTIssuer   = "vaultflow-gateway"
+	adminJWTAudience = "vaultflow-admin"
+)
+
+// adminAuth Bearer JWT (HS256, sub+exp+iss+aud 必填) -> ctx admin subject.
 func (s *Server) adminAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hdr := strings.TrimSpace(r.Header.Get("Authorization"))
@@ -139,7 +146,11 @@ func (s *Server) adminAuth(next http.Handler) http.Handler {
 		}
 		tok, err := jwt.Parse(raw, func(t *jwt.Token) (any, error) {
 			return s.deps.AdminJWTKey, nil
-		}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
+		},
+			jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}),
+			jwt.WithExpirationRequired(),
+			jwt.WithIssuer(adminJWTIssuer),
+			jwt.WithAudience(adminJWTAudience))
 		if err != nil || !tok.Valid {
 			writeError(w, r, unauthorized("invalid bearer token"))
 			return

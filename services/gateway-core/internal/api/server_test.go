@@ -210,6 +210,7 @@ func adminJWT(t *testing.T, key []byte, sub string) string {
 	t.Helper()
 	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub": sub, "exp": time.Now().Add(time.Hour).Unix(),
+		"iss": adminJWTIssuer, "aud": adminJWTAudience,
 	}).SignedString(key)
 	if err != nil {
 		t.Fatalf("sign jwt: %v", err)
@@ -289,6 +290,7 @@ func TestAdminAuth_Expired(t *testing.T) {
 	srv := newTestServer(t, nil)
 	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"sub": "admin-1", "exp": time.Now().Add(-time.Hour).Unix(),
+		"iss": adminJWTIssuer, "aud": adminJWTAudience,
 	}).SignedString([]byte("test-admin-secret"))
 	if err != nil {
 		t.Fatal(err)
@@ -297,6 +299,56 @@ func TestAdminAuth_Expired(t *testing.T) {
 		map[string]string{"Authorization": "Bearer " + tok})
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("expired JWT: status=%d want 401", rec.Code)
+	}
+}
+
+// 回归: 缺 exp / iss / aud 的令牌必须 401 — 防无期限 forged token
+// 与跨用途 JWT 串用 (sfind-5cabf64c).
+func TestAdminAuth_ClaimRequirements(t *testing.T) {
+	srv := newTestServer(t, nil)
+	key := []byte("test-admin-secret")
+	sign := func(t *testing.T, claims jwt.MapClaims) string {
+		t.Helper()
+		tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tok
+	}
+	valid := jwt.MapClaims{
+		"sub": "admin-1", "exp": time.Now().Add(time.Hour).Unix(),
+		"iss": adminJWTIssuer, "aud": adminJWTAudience,
+	}
+	for name, drop := range map[string]string{
+		"missing exp": "exp",
+		"missing iss": "iss",
+		"missing aud": "aud",
+	} {
+		c := jwt.MapClaims{}
+		for k, v := range valid {
+			c[k] = v
+		}
+		delete(c, drop)
+		rec := doJSON(t, srv, "GET", "/v1/admin/signer/health", nil,
+			map[string]string{"Authorization": "Bearer " + sign(t, c)})
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: status=%d want 401", name, rec.Code)
+		}
+	}
+	for name, mutate := range map[string]func(jwt.MapClaims){
+		"wrong iss": func(c jwt.MapClaims) { c["iss"] = "other-service" },
+		"wrong aud": func(c jwt.MapClaims) { c["aud"] = "other-audience" },
+	} {
+		c := jwt.MapClaims{}
+		for k, v := range valid {
+			c[k] = v
+		}
+		mutate(c)
+		rec := doJSON(t, srv, "GET", "/v1/admin/signer/health", nil,
+			map[string]string{"Authorization": "Bearer " + sign(t, c)})
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: status=%d want 401", name, rec.Code)
+		}
 	}
 }
 

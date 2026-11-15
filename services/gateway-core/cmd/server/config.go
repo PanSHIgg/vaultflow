@@ -47,6 +47,9 @@ type deploymentConfig struct {
 	Chains         map[string]*chainRuntime `json:"chains"`
 }
 
+// devAdminJWTSecret 旧 dev 字面量 — 仅用于拒绝比对, 绝不作为密钥回退.
+const devAdminJWTSecret = "vaultflow-dev-admin-secret"
+
 // appConfig 全量装配配置.
 type appConfig struct {
 	Port           int
@@ -113,12 +116,26 @@ func loadAppConfig() (*appConfig, error) {
 		MTLSKeyFile:         envStr("MTLS_CLIENT_KEY", "certs/clients/gateway-core.key"),
 		MTLSCAFile:          envStr("MTLS_CA_CERT", "certs/ca/ca.crt"),
 		MTLSServerName:      envStr("MTLS_SERVER_NAME", "vault-signer"),
-		AdminJWTKey:         []byte(envStr("ADMIN_JWT_SECRET", "vaultflow-dev-admin-secret")),
+		AdminJWTKey:         []byte(strings.TrimSpace(os.Getenv("ADMIN_JWT_SECRET"))),
 		SimEnabled:          envBool("ENABLE_DEV_SIMULATOR", false),
 		WebhookInsecureHTTP: envBool("WEBHOOK_ALLOW_INSECURE_HTTP", false),
 	}
 	if cfg.DatabaseURL == "" {
 		return nil, fmt.Errorf("config: DATABASE_URL is required")
+	}
+	// ADMIN_JWT_SECRET 为 /v1/admin/** + /v1/sim/** 唯一鉴权根 — 禁止回退到
+	// 任何内置默认: 空即拒启动; 命中已知公开 dev 字面量需
+	// ALLOW_DEV_ADMIN_SECRET=true 显式 opt-in (否则与全网可铸的管理端令牌
+	// 等价); 其余值最小 32B 对齐 HS256 密钥强度惯例.
+	if len(cfg.AdminJWTKey) == 0 {
+		return nil, fmt.Errorf("config: ADMIN_JWT_SECRET is required")
+	}
+	if string(cfg.AdminJWTKey) == devAdminJWTSecret {
+		if !envBool("ALLOW_DEV_ADMIN_SECRET", false) {
+			return nil, fmt.Errorf("config: ADMIN_JWT_SECRET equals the public dev value; generate a real secret (deploy-and-seed.sh does) or set ALLOW_DEV_ADMIN_SECRET=true for local dev only")
+		}
+	} else if len(cfg.AdminJWTKey) < 32 {
+		return nil, fmt.Errorf("config: ADMIN_JWT_SECRET must be at least 32 bytes")
 	}
 	raw := strings.TrimSpace(os.Getenv("CHAIN_CONFIG_JSON"))
 	if raw == "" {
