@@ -450,6 +450,8 @@ with open(out, "w") as f:
     for k, v in env.items():
         f.write(f"{k}={v}\n")
 PY
+# gateway.env 内含 ADMIN_JWT_SECRET — 收紧属主独占, 防同机其他用户读取铸签.
+chmod 600 "$GATEWAY_ENV"
 log "wrote $GATEWAY_ENV"
 
 # ---------------------------------------------------------------------------
