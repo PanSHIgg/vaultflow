@@ -38,12 +38,21 @@ for _ in $(seq 1 90); do
 done
 [ "$ok" = "1" ] || { echo "gateway unhealthy" >&2; exit 1; }
 echo "    gateway healthy; signer check:"
-curl -fsS -H "Authorization: Bearer $(node -e '
+# Admin JWT minted with the per-deploy secret from deploy/gateway.env
+# (never the public dev literal); iss/aud mirror gateway adminAuth contract.
+ADMIN_JWT_SECRET="$(sed -n 's/^ADMIN_JWT_SECRET=//p' deploy/gateway.env 2>/dev/null | tail -1 || true)"
+if [ -z "$ADMIN_JWT_SECRET" ]; then
+  echo "    (skipped: deploy/gateway.env missing ADMIN_JWT_SECRET)"
+else
+curl -fsS -H "Authorization: Bearer $(ADMIN_JWT_SECRET="$ADMIN_JWT_SECRET" node -e '
   const c=require("crypto");
-  const h=(s)=>c.createHmac("sha256","vaultflow-dev-admin-secret").update(s).digest("base64url");
+  const h=(s)=>c.createHmac("sha256",process.env.ADMIN_JWT_SECRET).update(s).digest("base64url");
   const p=(o)=>Buffer.from(JSON.stringify(o)).toString("base64url");
-  process.stdout.write(`${p({alg:"HS256",typ:"JWT"})}.${p({sub:"e2e-admin",role:"admin",exp:Math.floor(Date.now()/1000)+600})}.`+h(`${p({alg:"HS256",typ:"JWT"})}.${p({sub:"e2e-admin",role:"admin",exp:Math.floor(Date.now()/1000)+600})}`));
+  const hdr=p({alg:"HS256",typ:"JWT"});
+  const pl=p({iss:"vaultflow-gateway",aud:"vaultflow-admin",sub:"e2e-admin",role:"admin",exp:Math.floor(Date.now()/1000)+600});
+  process.stdout.write(`${hdr}.${pl}.`+h(`${hdr}.${pl}`));
 ')" http://localhost:8080/v1/admin/signer/health || true
+fi
 echo
 
 for s in "${SCEN[@]}"; do

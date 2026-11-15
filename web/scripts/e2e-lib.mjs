@@ -23,7 +23,15 @@ export const RPC_A = process.env.ANVIL_RPC ?? "http://localhost:8545";
 export const API_KEY =
   process.env.VF_API_KEY ?? "vf_demo_c12724dadc929d6a43a6b810e8779a362efb51e082401a39";
 export const MERCHANT_ID = "11111111-2222-3333-4444-555555555555";
-export const ADMIN_JWT_SECRET = "vaultflow-dev-admin-secret"; // deploy/gateway.env dev secret
+// Admin JWT HMAC key: deploy-and-seed.sh writes a per-deploy random secret
+// into deploy/gateway.env (gitignored); env var wins for ad-hoc overrides.
+// iss/aud mirror adminAuth in services/gateway-core/internal/api/middleware.go.
+export const ADMIN_JWT_ISS = "vaultflow-gateway";
+export const ADMIN_JWT_AUD = "vaultflow-admin";
+const gatewayEnvText = readFileSync(path.join(DEPLOY_DIR, "gateway.env"), "utf8");
+export const ADMIN_JWT_SECRET =
+  process.env.ADMIN_JWT_SECRET ??
+  gatewayEnvText.split(/\r?\n/).find((l) => l.startsWith("ADMIN_JWT_SECRET="))?.slice("ADMIN_JWT_SECRET=".length);
 
 export const CHAIN_ID = 31337;
 export const USDC = DEPLOYED.chains[String(CHAIN_ID)].usdc;
@@ -109,7 +117,10 @@ let adminJwt;
 export function adminToken() {
   if (!adminJwt) {
     const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64url");
+    if (!ADMIN_JWT_SECRET) throw new Error("ADMIN_JWT_SECRET unset — run scripts/deploy-and-seed.sh or export it");
     const h = `${b64({ alg: "HS256", typ: "JWT" })}.${b64({
+      iss: ADMIN_JWT_ISS,
+      aud: ADMIN_JWT_AUD,
       sub: "i2-e2e-admin",
       iat: Math.floor(Date.now() / 1000),
       exp: Math.floor(Date.now() / 1000) + 7200,

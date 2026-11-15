@@ -385,13 +385,26 @@ log "wrote $SIGNER_CFG"
 # ---------------------------------------------------------------------------
 # 11. gateway.env (CHAIN_CONFIG_JSON + 装配 env)
 # ---------------------------------------------------------------------------
+# ADMIN_JWT_SECRET: 运维可经同名环境变量注入; 否则复用既有 gateway.env 值
+# (幂等重跑不滚动密钥), 缺失或为旧 dev 字面量时新生成 64-hex 随机值 —
+# 公开字面量永不写入 env (gateway 启动时亦会拒绝它).
+if [ -z "${ADMIN_JWT_SECRET:-}" ]; then
+    ADMIN_JWT_SECRET="$(sed -n 's/^ADMIN_JWT_SECRET=//p' "$GATEWAY_ENV" 2>/dev/null | tail -1 || true)"
+fi
+if [ -z "$ADMIN_JWT_SECRET" ] || [ "$ADMIN_JWT_SECRET" = "vaultflow-dev-admin-secret" ]; then
+    ADMIN_JWT_SECRET="$(openssl rand -hex 32)"
+    log "generated fresh ADMIN_JWT_SECRET (previous absent or public dev value)"
+fi
+
 python3 - "$GATEWAY_ENV" "$DEPLOYED_JSON" "$IMPL" "$ICH_A" \
         "$RPC_A_INNER" "$RPC_B_INNER" \
-        "$A_RELAYER" "$A_PAYOUT" "$A_COLD" "$B_RELAYER" "$B_PAYOUT" "$B_COLD" "$FUNDING" <<'PY'
+        "$A_RELAYER" "$A_PAYOUT" "$A_COLD" "$B_RELAYER" "$B_PAYOUT" "$B_COLD" "$FUNDING" \
+        "$ADMIN_JWT_SECRET" <<'PY'
 import json, sys
 out, dep, impl, ich = sys.argv[1], json.load(open(sys.argv[2])), sys.argv[3], sys.argv[4]
 ra_inner, rb_inner = sys.argv[5], sys.argv[6]
 ra, pa, ca, rb, pb, cb, funding = [a.lower() for a in sys.argv[7:14]]
+jwt_secret = sys.argv[14]
 C = dep["chains"]
 def c(cid, rpc, relayer, payout, cold):
     x = C[cid]
@@ -425,7 +438,7 @@ env = {
     "MTLS_CLIENT_KEY": "/etc/vaultflow/certs/clients/gateway-core.key",
     "MTLS_CA_CERT": "/etc/vaultflow/certs/ca/ca.crt",
     "MTLS_SERVER_NAME": "vault-signer",
-    "ADMIN_JWT_SECRET": "vaultflow-dev-admin-secret",
+    "ADMIN_JWT_SECRET": jwt_secret,
     "ENABLE_DEV_SIMULATOR": "true",
     "WEBHOOK_ALLOW_INSECURE_HTTP": "true",
     "MIGRATIONS_DIR": "/app/migrations",
