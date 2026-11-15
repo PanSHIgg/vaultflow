@@ -1,5 +1,7 @@
 # --- Project docs (design/progress notes stay local, untracked) ---
 *.md
+# The threat model is tracked so security scans can start from it.
+!SECURITY_MODEL.md
 
 # --- Secrets & local env (NEVER commit) ---
 .env
