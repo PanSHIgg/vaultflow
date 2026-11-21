@@ -45,9 +45,10 @@ function Step({ n, done, last = false, title, children }: {
   );
 }
 
-function Select({ value, onChange, children }: {
+function Select({ value, onChange, label, children }: {
   value: string;
   onChange: (value: string) => void;
+  label: string;
   children: ReactNode;
 }) {
   return (
@@ -55,6 +56,7 @@ function Select({ value, onChange, children }: {
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
+        aria-label={label}
         className="w-full appearance-none rounded-lg border border-[#2B3139] bg-[#1E2329] px-3 py-2.5 pr-9 text-sm text-[#EAECEF] outline-none transition focus:border-[#FCD535]"
       >
         {children}
@@ -157,7 +159,7 @@ function DepositContent() {
           ) : assets.isError ? (
             <p className="text-sm text-red-300">加载币种失败</p>
           ) : (
-            <Select value={coin ?? ""} onChange={setCoin}>
+            <Select value={coin ?? ""} onChange={setCoin} label="选择币种">
               {coins.map((c) => (
                 <option key={c} value={c}>{c}</option>
               ))}
@@ -169,6 +171,7 @@ function DepositContent() {
           <Select
             value={network ? String(network.chain_id) : ""}
             onChange={(v) => setChainId(Number(v))}
+            label="选择网络"
           >
             {networks.map((n) => (
               <option key={n.chain_id} value={n.chain_id}>

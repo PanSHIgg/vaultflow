@@ -26,7 +26,8 @@ export default function LoginPage() {
       const res = mode === "login" ? await api.login(email, password) : await api.register(email, password);
       qc.clear();
       setSession(res.token, email);
-      router.replace("/");
+      const next = new URLSearchParams(window.location.search).get("next");
+      router.replace(next && next.startsWith("/") && !next.startsWith("//") ? next : "/");
     } catch (err) {
       setError(err);
     } finally {

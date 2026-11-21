@@ -22,12 +22,13 @@ export function Shell({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!getToken()) {
-      router.replace("/login");
+      const next = `${pathname}${window.location.search}`;
+      router.replace(`/login?next=${encodeURIComponent(next)}`);
       setAuthed(false);
     } else {
       setAuthed(true);
     }
-  }, [router]);
+  }, [router, pathname]);
 
   if (authed !== true) {
     return (
