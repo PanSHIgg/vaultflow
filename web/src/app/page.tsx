@@ -2,9 +2,10 @@
 
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import QRCode from "react-qr-code";
 import * as api from "@/lib/api";
+import { formatTokenAmount } from "@/lib/amount";
 import { clearSession, getEmail, getToken } from "@/lib/auth";
 import { DEPOSIT_STATUS_LABEL, DEPOSIT_STATUS_TONE, fmtDateTime, shortAddr } from "@/lib/format";
 import type { Asset } from "@/lib/types";
@@ -12,6 +13,7 @@ import { Badge, Card, CopyButton, Spinner } from "@/components/ui";
 
 export default function DepositPage() {
   const router = useRouter();
+  const qc = useQueryClient();
   const [authed, setAuthed] = useState<boolean | null>(null);
   const [coin, setCoin] = useState<string | null>(null);
   const [chainId, setChainId] = useState<number | null>(null);
@@ -54,11 +56,18 @@ export default function DepositPage() {
     enabled: authed === true && network != null,
   });
 
-  const deposits = useQuery({
+  const deposits = useInfiniteQuery({
     queryKey: ["deposits", network?.chain_id],
-    queryFn: () => api.listDeposits(network ? { chain_id: network.chain_id } : {}),
+    queryFn: ({ pageParam }) =>
+      api.listDeposits({ ...(network ? { chain_id: network.chain_id } : {}), ...(pageParam ? { cursor: pageParam } : {}) }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
     enabled: authed === true,
   });
+  const depositItems = useMemo(
+    () => (deposits.data?.pages ?? []).flatMap((p) => p.items),
+    [deposits.data],
+  );
 
   if (authed !== true) {
     return (
@@ -81,6 +90,7 @@ export default function DepositPage() {
             type="button"
             className="hover:text-[#FCD535]"
             onClick={() => {
+              qc.clear();
               clearSession();
               router.replace("/login");
             }}
@@ -162,7 +172,9 @@ export default function DepositPage() {
               <dl className="w-full space-y-2 text-sm">
                 <div className="flex justify-between">
                   <dt className="text-[#848E9C]">最小充值金额</dt>
-                  <dd className="font-mono">{network?.min_deposit ?? "—"} {coin}</dd>
+                  <dd className="font-mono">
+                    {network ? formatTokenAmount(network.min_deposit, network.decimals, { symbol: coin ?? undefined }) : "—"}
+                  </dd>
                 </div>
                 <div className="flex justify-between">
                   <dt className="text-[#848E9C]">预计到账</dt>
@@ -187,7 +199,7 @@ export default function DepositPage() {
       <Card title="充值记录" className="mt-4">
         {deposits.isLoading ? (
           <div className="flex justify-center py-6"><Spinner className="text-[#FCD535]" /></div>
-        ) : (deposits.data?.items.length ?? 0) === 0 ? (
+        ) : depositItems.length === 0 ? (
           <p className="py-6 text-center text-sm text-[#848E9C]">暂无充值记录</p>
         ) : (
           <div className="overflow-x-auto">
@@ -202,10 +214,12 @@ export default function DepositPage() {
                 </tr>
               </thead>
               <tbody>
-                {deposits.data!.items.map((d) => (
+                {depositItems.map((d) => (
                   <tr key={d.tx_hash} className="border-b border-[#2B3139]/60 last:border-0">
                     <td className="py-2.5 pr-4 font-medium">{d.token_symbol}</td>
-                    <td className="py-2.5 pr-4 font-mono">{d.amount}</td>
+                    <td className="py-2.5 pr-4 font-mono">
+                      {formatTokenAmount(d.amount, d.decimals)}
+                    </td>
                     <td className="py-2.5 pr-4">
                       <Badge tone={DEPOSIT_STATUS_TONE[d.status]}>
                         {d.status === "PENDING"
@@ -219,6 +233,18 @@ export default function DepositPage() {
                 ))}
               </tbody>
             </table>
+            {deposits.hasNextPage && (
+              <div className="flex justify-center pt-3">
+                <button
+                  type="button"
+                  onClick={() => deposits.fetchNextPage()}
+                  disabled={deposits.isFetchingNextPage}
+                  className="text-sm text-[#848E9C] transition hover:text-[#FCD535]"
+                >
+                  {deposits.isFetchingNextPage ? "加载中…" : "加载更多"}
+                </button>
+              </div>
+            )}
           </div>
         )}
       </Card>

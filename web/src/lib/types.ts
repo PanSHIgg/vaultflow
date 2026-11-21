@@ -11,7 +11,9 @@ export interface Asset {
   chain_id: number;
   token_contract: string;
   required_confirmations: number;
+  /** Atomic units (NUMERIC(78,0) decimal string); display via `decimals`. */
   min_deposit: string;
+  decimals: number;
 }
 
 export interface DepositAddress {
@@ -26,7 +28,9 @@ export type DepositStatus = "PENDING" | "CONFIRMED" | "CREDITED" | "SWEPT";
 export interface DepositRecord {
   tx_hash: string;
   token_symbol: string;
+  /** Atomic units (NUMERIC(78,0) decimal string); display via `decimals`. */
   amount: string;
+  decimals: number;
   confirmations: number;
   required_confirmations: number;
   status: DepositStatus;
@@ -41,6 +45,8 @@ export interface DepositPage {
 export interface Balance {
   chain_id: number;
   token_symbol: string;
+  /** Atomic units (NUMERIC(78,0) decimal strings); display via `decimals`. */
   available: string;
   pending: string;
+  decimals: number;
 }

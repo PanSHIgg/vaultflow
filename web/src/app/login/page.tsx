@@ -1,6 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
+import { useQueryClient } from "@tanstack/react-query";
 import { useState, type FormEvent } from "react";
 import * as api from "@/lib/api";
 import { setSession } from "@/lib/auth";
@@ -10,6 +11,7 @@ type Mode = "login" | "register";
 
 export default function LoginPage() {
   const router = useRouter();
+  const qc = useQueryClient();
   const [mode, setMode] = useState<Mode>("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -22,6 +24,7 @@ export default function LoginPage() {
     setError(null);
     try {
       const res = mode === "login" ? await api.login(email, password) : await api.register(email, password);
+      qc.clear();
       setSession(res.token, email);
       router.replace("/");
     } catch (err) {
