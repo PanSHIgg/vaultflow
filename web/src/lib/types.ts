@@ -9,7 +9,13 @@ export interface AuthResponse {
 export interface Asset {
   token_symbol: string;
   chain_id: number;
+  /** Network display name, e.g. "Anvil Local" (EVM chains only). */
+  chain_name?: string;
   token_contract: string;
+  /** Explorer URL for the token contract (查看详情); absent → plain text. */
+  token_explorer_url?: string;
+  /** Approximate seconds per block — drives the 充币到账时间 estimate. */
+  block_time_seconds?: number;
   required_confirmations: number;
   /** Atomic units (NUMERIC(78,0) decimal string); display via `decimals`. */
   min_deposit: string;

@@ -28,3 +28,10 @@ export function fmtDateTime(iso: string | null | undefined): string {
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleString("zh-CN", { hour12: false });
 }
+
+/** Rough human duration for the 充币到账时间 row, e.g. "约 2 分钟". */
+export function estDuration(totalSeconds: number): string {
+  if (!Number.isFinite(totalSeconds) || totalSeconds <= 0) return "约 1 分钟";
+  if (totalSeconds < 3600) return `约 ${Math.max(1, Math.round(totalSeconds / 60))} 分钟`;
+  return `约 ${(totalSeconds / 3600).toFixed(1)} 小时`;
+}
