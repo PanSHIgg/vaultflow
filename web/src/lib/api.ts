@@ -77,7 +77,7 @@ export function getDepositAddress(chainId: number): Promise<DepositAddress> {
 
 export function listDeposits(q: { chain_id?: number; cursor?: string } = {}): Promise<DepositPage> {
   const params = new URLSearchParams();
-  if (q.chain_id) params.set("chain_id", String(q.chain_id));
+  if (q.chain_id != null) params.set("chain_id", String(q.chain_id));
   if (q.cursor) params.set("cursor", q.cursor);
   const qs = params.toString();
   return request("GET", `/v1/me/deposits${qs ? `?${qs}` : ""}`);
