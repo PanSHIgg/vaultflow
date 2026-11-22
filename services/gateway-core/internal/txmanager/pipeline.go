@@ -21,17 +21,17 @@ import (
 )
 
 // txParams 一笔候选交易的全部可签名参数 (链 ID 与 Nonce 取 intent).
+// PAYOUT 的幂等槽字段 payoutUUID/retrySeq 仅 MERCHANT_PAYOUT 用.
 type txParams struct {
-	to           types.Address
-	value        *big.Int
-	calldata     []byte
-	gasLimit     uint64
-	maxFee       *big.Int
-	maxTip       *big.Int
-	policy       ports.TxPolicy
-	payoutUUID   uuid.UUID // PAYOUT 幂等槽绑定 (其余策略零值)
-	retrySeq     uint32
-	refundTicket *ports.RefundTicket
+	to         types.Address
+	value      *big.Int
+	calldata   []byte
+	gasLimit   uint64
+	maxFee     *big.Int
+	maxTip     *big.Int
+	policy     ports.TxPolicy
+	payoutUUID uuid.UUID
+	retrySeq   uint32
 }
 
 // BuildUnsignedTx 组装 EIP-2718 Type-2 (EIP-1559) 未签名原始字节:
@@ -82,8 +82,6 @@ func policyFor(t types.IntentType) ports.TxPolicy {
 	switch t {
 	case types.IntentTypeSweepBatch:
 		return ports.TxPolicySweep
-	case types.IntentTypeEIP3009Relay:
-		return ports.TxPolicyEIP3009Relay
 	case types.IntentTypeMerchantPayout:
 		return ports.TxPolicyPayout
 	case types.IntentTypeNonceGapFiller:
@@ -94,26 +92,17 @@ func policyFor(t types.IntentType) ports.TxPolicy {
 
 // paramsFromRequest 首播参数 = QueueIntentRequest 原样 (calldata 由调用方 ABI 编码).
 func paramsFromRequest(req ports.QueueIntentRequest) txParams {
-	gas := req.GasLimit
 	return txParams{
-		to:           req.To,
-		value:        req.Value.Big(),
-		calldata:     req.Calldata,
-		gasLimit:     gas,
-		maxFee:       req.MaxFeePerGas.Big(),
-		maxTip:       req.MaxPriorityFeePerGas.Big(),
-		policy:       policyFor(req.IntentType),
-		payoutUUID:   payoutUUIDFor(req),
-		retrySeq:     req.RetrySeq,
-		refundTicket: req.RefundTicket,
+		to:         req.To,
+		value:      req.Value.Big(),
+		calldata:   req.Calldata,
+		gasLimit:   req.GasLimit,
+		maxFee:     req.MaxFeePerGas.Big(),
+		maxTip:     req.MaxPriorityFeePerGas.Big(),
+		policy:     policyFor(req.IntentType),
+		payoutUUID: req.ReferenceID,
+		retrySeq:   req.RetrySeq,
 	}
-}
-
-func payoutUUIDFor(req ports.QueueIntentRequest) uuid.UUID {
-	if req.IntentType == types.IntentTypeMerchantPayout {
-		return req.ReferenceID
-	}
-	return uuid.Nil
 }
 
 // fillerParams 同 Nonce GAP_FILLER 取消候选: to==from, value=0, data=∅, gas=21000.
@@ -223,27 +212,13 @@ func (m *Manager) broadcastIntent(ctx context.Context, intentID uuid.UUID) error
 }
 
 // cancelBroadcastReason 首播前业务/运维取消复核 (E2), 返回非空原因串即须
-// filler 化:
-//
-//	(a) last_error 带 CANCEL_REQUESTED 标记 — RequestCancel QUEUED 受理;
-//	(b) MERCHANT_PAYOUT 关联 merchant_payouts 已 CANCELLED_UNLOCKED —
-//	    CancelPayout 在 QueueIntent→首播窗口竞速获胜 (快照读: 本检查与
-//	    CancelPayout 提交的微秒级交错由 indexer 结算侧迁移守卫兜底).
+// filler 化: last_error 带 CANCEL_REQUESTED 标记 — RequestCancel QUEUED 受理.
 func (m *Manager) cancelBroadcastReason(ctx context.Context, intent types.OutboundTxIntent) string {
 	var le *string
 	if err := m.db.QueryRow(ctx,
 		`SELECT last_error FROM outbound_tx_intents WHERE id=$1`, intent.ID).Scan(&le); err == nil &&
 		le != nil && strings.HasPrefix(*le, lastErrorPrefixCancelRequested) {
 		return *le
-	}
-	if intent.IntentType == types.IntentTypeMerchantPayout {
-		var st string
-		if err := m.db.QueryRow(ctx,
-			`SELECT status FROM merchant_payouts WHERE id=$1`, intent.ReferenceID).Scan(&st); err == nil &&
-			types.PayoutStatus(st) == types.PayoutCancelledUnlocked {
-			return fmt.Sprintf("%s: payout %s is CANCELLED_UNLOCKED at broadcast",
-				lastErrorPrefixCancelRequested, intent.ReferenceID)
-		}
 	}
 	return ""
 }
@@ -317,12 +292,11 @@ func (m *Manager) signBroadcastPersist(ctx context.Context, intent types.Outboun
 		return err
 	}
 	resp, err := m.signer.SignTx(ctx, ports.SignTxRequest{
-		ChainID:      uint64(intent.ChainID),
-		UnsignedTx:   unsigned,
-		PolicyHint:   p.policy,
-		PayoutUUID:   p.payoutUUID,
-		RetrySeq:     p.retrySeq,
-		RefundTicket: p.refundTicket,
+		ChainID:    uint64(intent.ChainID),
+		UnsignedTx: unsigned,
+		PolicyHint: p.policy,
+		PayoutUUID: p.payoutUUID,
+		RetrySeq:   p.retrySeq,
 	})
 	if err != nil {
 		m.recordError(ctx, intent.ID, err) // signer RPC 瞬时错误 — 可重试
@@ -453,8 +427,7 @@ func (m *Manager) cancelRejectedIntent(ctx context.Context, intent types.Outboun
 }
 
 // markSignerRejected B6 — signer 连 GAP_FILLER 兜底也拒签 (策略配置错误或
-// 签名服务异常): 意图落显式终态 REJECTED_BY_SIGNER + last_error + CRITICAL
-// 告警; MERCHANT_PAYOUT 关联单同事务回 FAILED_RETRYABLE 防资金悬挂.
+// 签名服务异常): 意图落显式终态 REJECTED_BY_SIGNER + last_error + CRITICAL 告警.
 // 残余风险 (报告记录): 该 Nonce 洞仍需运维处置 (修配置后人工 filler 或钱包
 // 级停队列), 后继意图广播将排队等该 Nonce.
 func (m *Manager) markSignerRejected(ctx context.Context, intent types.OutboundTxIntent,
@@ -463,21 +436,11 @@ func (m *Manager) markSignerRejected(ctx context.Context, intent types.OutboundT
 	msg := fmt.Sprintf("%s: kind=%s code=%d reason=%s",
 		lastErrorPrefixSignerRejected, kind, rej.Code, rej.Reason)
 	err := pgx.BeginFunc(ctx, m.db, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx,
+		_, err := tx.Exec(ctx,
 			`UPDATE outbound_tx_intents
 			    SET status='REJECTED_BY_SIGNER', last_error=$2, last_error_at=now()
-			  WHERE id=$1 AND status IN ('QUEUED','IN_FLIGHT')`, intent.ID, msg); err != nil {
-			return err
-		}
-		if intent.IntentType == types.IntentTypeMerchantPayout {
-			// 业务行兜底: payout 可重试 (与 indexer failPayoutRetryable 同语义).
-			if _, err := tx.Exec(ctx,
-				`UPDATE merchant_payouts SET status='FAILED_RETRYABLE'
-				  WHERE id=$1 AND status='IN_FLIGHT'`, intent.ReferenceID); err != nil {
-				return err
-			}
-		}
-		return nil
+			  WHERE id=$1 AND status IN ('QUEUED','IN_FLIGHT')`, intent.ID, msg)
+		return err
 	})
 	if err != nil {
 		return fmt.Errorf("mark signer-rejected: %w", err)
@@ -576,12 +539,9 @@ func (m *Manager) RebroadcastIntent(ctx context.Context, intentID uuid.UUID) err
 			return err
 		}
 		resp, err := m.signer.SignTx(ctx, ports.SignTxRequest{
-			ChainID:      uint64(intent.ChainID),
-			UnsignedTx:   unsigned,
-			PolicyHint:   p.policy,
-			PayoutUUID:   p.payoutUUID,
-			RetrySeq:     p.retrySeq,
-			RefundTicket: p.refundTicket,
+			ChainID:    uint64(intent.ChainID),
+			UnsignedTx: unsigned,
+			PolicyHint: p.policy,
 		})
 		if err != nil || resp.Signed == nil {
 			m.log.Warn("rebroadcast resign failed",
@@ -610,10 +570,6 @@ func (m *Manager) defaultGas(t types.IntentType, itemCount int) uint64 {
 	switch t {
 	case types.IntentTypeSweepBatch:
 		return m.cfg.GasLimitSweepBase + uint64(itemCount)*m.cfg.GasLimitSweepItem
-	case types.IntentTypeMerchantPayout:
-		return m.cfg.GasLimitPayout
-	case types.IntentTypeEIP3009Relay:
-		return m.cfg.GasLimitRelay
 	case types.IntentTypeNonceGapFiller:
 		return 21_000
 	}

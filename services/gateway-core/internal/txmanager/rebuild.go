@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"math/big"
 
-	"github.com/google/uuid"
-
 	"vaultflow/gateway-core/internal/chain"
 	"vaultflow/gateway-core/internal/ports"
 	"vaultflow/gateway-core/internal/types"
@@ -22,12 +20,14 @@ import (
 // EIP-1559 载荷; 确定性签名下重放同参数字节复现同 tx_hash / 命中 Signer 同
 // Nonce 幂等槽. 优先级:
 //   ① pendingParams 内存 fast-path (broadcastIntent 侧);
-//   ② payload_* 持久化列 (本函数, 全类型 — 含 EIP3009_RELAY);
+//   ② payload_* 持久化列 (本函数);
 //   ③ 迁移前旧行的业务表兼容重建:
-//       SWEEP_BATCH       -> deployAndSweepBatch(sweep_batch_items ⋈ deposit_addresses.salt)
-//       MERCHANT_PAYOUT   -> ERC20 transfer(merchant_payouts.to_address, amount)
-//       EIP3009_RELAY     -> ErrRebuildUnsupported (仅可能出现在 002 之前的旧行)
+//       SWEEP_BATCH -> deployAndSweepBatch(sweep_batch_items ⋈
+//                      user_deposit_addresses.create2_salt)
 //   NONCE_GAP_FILLER / attempt_kind=GAP_FILLER -> 0 ETH 自转账 (不读载荷).
+// 交易所托管模型下 outbound_tx_intents.intent_type CHECK 仅允许
+// SWEEP_BATCH / NONCE_GAP_FILLER — MERCHANT_PAYOUT / EIP3009_RELAY
+// 重建路径已随商户模型删除.
 // ---------------------------------------------------------------------------
 
 // ErrRebuildUnsupported 载荷无法由持久化列或业务表确定性重建.
@@ -42,26 +42,16 @@ func (m *Manager) rebuildTxParams(ctx context.Context, it types.OutboundTxIntent
 		return fillerParams(it.WalletAddress, big.NewInt(0), big.NewInt(0)), nil
 	}
 
-	// ② 持久化载荷 (B1) — EIP3009_RELAY 唯一可用路径, 其余类型优先采用.
+	// ② 持久化载荷 (B1) — 全类型优先采用.
 	if p, ok, err := m.payloadParams(ctx, it); err != nil {
 		return txParams{}, err
 	} else if ok {
-		if it.IntentType == types.IntentTypeMerchantPayout {
-			if err := m.enrichPayoutParams(ctx, it.ReferenceID, &p); err != nil {
-				return txParams{}, err
-			}
-		}
 		return p, nil
 	}
 
 	// ③ 兼容路径: 无持久化载荷的迁移前旧行.
-	switch it.IntentType {
-	case types.IntentTypeMerchantPayout:
-		return m.rebuildPayout(ctx, it)
-	case types.IntentTypeSweepBatch:
+	if it.IntentType == types.IntentTypeSweepBatch {
 		return m.rebuildSweep(ctx, it)
-	case types.IntentTypeEIP3009Relay:
-		return txParams{}, fmt.Errorf("%w: EIP3009_RELAY payload not persisted", ErrRebuildUnsupported)
 	}
 	return txParams{}, fmt.Errorf("%w: intent_type=%s", ErrRebuildUnsupported, it.IntentType)
 }
@@ -69,8 +59,6 @@ func (m *Manager) rebuildTxParams(ctx context.Context, it types.OutboundTxIntent
 // payloadParams 从 outbound_tx_intents.payload_* 列重建基础签名参数
 // (to/value/calldata/gas/首播费率 + 类型默认 policy). 返回 ok=false 表示
 // 该行无持久化载荷 (迁移前旧行), 调用方走业务表兼容重建.
-// MERCHANT_PAYOUT 的幂等槽字段 (payoutUUID/retrySeq/refundTicket) 由
-// enrichPayoutParams 另行补齐.
 func (m *Manager) payloadParams(ctx context.Context, it types.OutboundTxIntent) (txParams, bool, error) {
 	var to *string
 	var data []byte
@@ -87,11 +75,10 @@ func (m *Manager) payloadParams(ctx context.Context, it types.OutboundTxIntent) 
 		return txParams{}, false, nil
 	}
 	p := txParams{
-		to:         types.HexToAddress(*to),
-		value:      new(big.Int),
-		calldata:   data,
-		policy:     policyFor(it.IntentType),
-		payoutUUID: uuid.Nil,
+		to:       types.HexToAddress(*to),
+		value:    new(big.Int),
+		calldata: data,
+		policy:   policyFor(it.IntentType),
 	}
 	if value != nil {
 		p.value = types.MustParseU256(*value).Big()
@@ -112,6 +99,17 @@ func (m *Manager) payloadParams(ctx context.Context, it types.OutboundTxIntent) 
 		return txParams{}, false,
 			fmt.Errorf("%w: intent %s missing persisted fee fields", ErrRebuildUnsupported, it.ID)
 	}
+	// PAYOUT 幂等槽: payout_uuid=业务单号, retry_seq=下一次 attempt 序号
+	// (每次签名占新槽, signer nonce-slot 绑定不串).
+	if it.IntentType == types.IntentTypeMerchantPayout {
+		p.payoutUUID = it.ReferenceID
+		var next int
+		if err := m.db.QueryRow(ctx,
+			`SELECT COALESCE(MAX(attempt_no),0)+1 FROM outbound_tx_attempts WHERE intent_id=$1`,
+			it.ID).Scan(&next); err == nil {
+			p.retrySeq = uint32(next)
+		}
+	}
 	return p, true, nil
 }
 
@@ -127,85 +125,6 @@ func (m *Manager) defaultGasForRebuild(ctx context.Context, it types.OutboundTxI
 		}
 	}
 	return m.defaultGas(it.IntentType, n)
-}
-
-// enrichPayoutParams MERCHANT_PAYOUT 幂等槽字段补齐: payoutUUID=reference_id,
-// retry_seq/admin_refund_ticket 取 merchant_payouts 当前值 (与 rebuildPayout
-// 同口径 — 同 Nonce 槽绑定的业务授权字段必须一致).
-func (m *Manager) enrichPayoutParams(ctx context.Context, payoutID uuid.UUID, p *txParams) error {
-	var retrySeq int32
-	var kind string
-	var ticket []byte
-	if err := m.db.QueryRow(ctx,
-		`SELECT retry_seq, payout_kind, COALESCE(admin_refund_ticket, ''::bytea)
-		   FROM merchant_payouts WHERE id=$1`, payoutID).
-		Scan(&retrySeq, &kind, &ticket); err != nil {
-		return fmt.Errorf("enrich payout %s: %w", payoutID, err)
-	}
-	p.policy = ports.TxPolicyPayout
-	p.payoutUUID = payoutID
-	p.retrySeq = uint32(retrySeq)
-	if types.PayoutKind(kind) == types.PayoutKindCustomerRefund && len(ticket) >= 127 {
-		t := &ports.RefundTicket{SignedPayload: ticket[:127]}
-		if len(ticket) >= 191 {
-			t.AdminSignature = ticket[127:191]
-		}
-		p.refundTicket = t
-	}
-	return nil
-}
-
-// rebuildPayout MERCHANT_PAYOUT: to=白名单稳定币合约, data=transfer(to,amount),
-// gas=GasLimitPayout, policy=PAYOUT, 幂等槽绑定 (payout_uuid, retry_seq),
-// CUSTOMER_REFUND 透传 RefundTicket.
-func (m *Manager) rebuildPayout(ctx context.Context, it types.OutboundTxIntent) (txParams, error) {
-	var p types.MerchantPayout
-	var amount, toAddr string
-	err := m.db.QueryRow(ctx,
-		`SELECT id, merchant_id, payout_kind, source_account_type, source_order_id,
-		        chain_id, asset_symbol, to_address, amount::text, retry_seq,
-		        COALESCE(admin_refund_ticket, ''::bytea), status
-		   FROM merchant_payouts WHERE id=$1`, it.ReferenceID).
-		Scan(&p.ID, &p.MerchantID, &p.PayoutKind, &p.SourceAccount, &p.SourceOrderID,
-			&p.ChainID, &p.AssetSymbol, &toAddr, &amount, &p.RetrySeq,
-			&p.AdminRefundTicket, &p.Status)
-	if err != nil {
-		return txParams{}, fmt.Errorf("load payout %s: %w", it.ReferenceID, err)
-	}
-
-	var tokenContract string
-	if err := m.db.QueryRow(ctx,
-		`SELECT token_contract FROM supported_assets
-		  WHERE chain_id=$1 AND asset_symbol=$2`,
-		int64(p.ChainID), p.AssetSymbol).Scan(&tokenContract); err != nil {
-		return txParams{}, fmt.Errorf("resolve token contract %s@%d: %w", p.AssetSymbol, p.ChainID, err)
-	}
-
-	p.ToAddress = types.HexToAddress(toAddr)
-	amt := types.MustParseU256(amount).Big()
-	to := types.HexToAddress(toAddr)
-	data, err := chain.EncodeERC20Transfer(to, amt)
-	if err != nil {
-		return txParams{}, err
-	}
-	out := txParams{
-		to:         types.HexToAddress(tokenContract),
-		value:      new(big.Int),
-		calldata:   data,
-		gasLimit:   m.cfg.GasLimitPayout,
-		policy:     ports.TxPolicyPayout,
-		payoutUUID: p.ID,
-		retrySeq:   uint32(p.RetrySeq),
-	}
-	// CUSTOMER_REFUND 透传票据: admin_refund_ticket = payload(127B) || sig(64B).
-	if p.PayoutKind == types.PayoutKindCustomerRefund && len(p.AdminRefundTicket) >= 127 {
-		ticket := &ports.RefundTicket{SignedPayload: p.AdminRefundTicket[:127]}
-		if len(p.AdminRefundTicket) >= 191 {
-			ticket.AdminSignature = p.AdminRefundTicket[127:191]
-		}
-		out.refundTicket = ticket
-	}
-	return out, nil
 }
 
 // rebuildSweep SWEEP_BATCH: to=BatchSweeper 合约 (由 items 所在批次目标决定? ——
@@ -231,9 +150,9 @@ func (m *Manager) rebuildSweep(ctx context.Context, it types.OutboundTxIntent) (
 		return txParams{}, fmt.Errorf("resolve token %s@%d: %w", batch.AssetSymbol, batch.ChainID, err)
 	}
 	rows, err := m.db.Query(ctx,
-		`SELECT da.create2_salt, i.exact_sweep_amount::text
+		`SELECT uda.create2_salt, i.exact_sweep_amount::text
 		   FROM sweep_batch_items i
-		   JOIN deposit_addresses da ON da.id = i.deposit_address_id
+		   JOIN user_deposit_addresses uda ON uda.id = i.deposit_address_id
 		  WHERE i.batch_id=$1 ORDER BY i.id`, batch.ID)
 	if err != nil {
 		return txParams{}, err
@@ -263,13 +182,21 @@ func (m *Manager) rebuildSweep(ctx context.Context, it types.OutboundTxIntent) (
 	if err != nil {
 		return txParams{}, err
 	}
+	gasBase, gasItem := m.cfg.GasLimitSweepBase, m.cfg.GasLimitSweepItem
+	if c, ok := m.chainContracts[it.ChainID]; ok {
+		if c.GasBase > 0 {
+			gasBase = c.GasBase
+		}
+		if c.GasItem > 0 {
+			gasItem = c.GasItem
+		}
+	}
 	return txParams{
-		to:         m.batchSweeperAddr(it.ChainID),
-		value:      new(big.Int),
-		calldata:   data,
-		gasLimit:   m.cfg.GasLimitSweepBase + uint64(len(items))*m.cfg.GasLimitSweepItem,
-		policy:     ports.TxPolicySweep,
-		payoutUUID: uuid.Nil,
+		to:       m.batchSweeperAddr(it.ChainID),
+		value:    new(big.Int),
+		calldata: data,
+		gasLimit: gasBase + uint64(len(items))*gasItem,
+		policy:   ports.TxPolicySweep,
 	}, nil
 }
 
@@ -292,6 +219,8 @@ type ChainContracts struct {
 	BatchSweeper  types.Address
 	EIP3009Router types.Address
 	Factory       types.Address
+	GasBase       uint64 // 归集批次基础 gas (0 -> GasLimitSweepBase 默认)
+	GasItem       uint64 // 归集每条目 gas (0 -> GasLimitSweepItem 默认)
 }
 
 // SetChainContracts 注入链级合约配置 (装配窗口 I1 调用; 测试同样经此注入).

@@ -19,11 +19,16 @@ use secrecy::{ExposeSecret, SecretVec};
 use zeroize::Zeroize;
 
 /// Abstracts KEK custody. `decrypt_dek` returns plaintext key material wrapped
-/// in `SecretVec` (zeroized on drop) — callers must keep it inside
+/// in `SecretVec` (zeroize on drop) — callers must keep it inside
 /// secrecy/zeroize types end-to-end and lock pages via mlock/VirtualLock.
 pub trait KmsProvider: Send + Sync {
     /// Open an AES-256-GCM envelope (nonce || ciphertext || tag) into a DEK.
     fn decrypt_dek(&self, ciphertext: &[u8]) -> anyhow::Result<SecretVec<u8>>;
+    /// Seal a plaintext DEK into a fresh envelope — used by runtime wallet
+    /// provisioning (GenerateWallet RPC): a new secp256k1 secret is generated
+    /// in-process, envelope-encrypted under the KEK and persisted to
+    /// `encrypted_keys`; the plaintext DEK never leaves the process.
+    fn encrypt_dek(&self, plaintext_dek: &[u8]) -> anyhow::Result<Vec<u8>>;
 }
 
 /// AES-GCM nonce length (96-bit, generated fresh per envelope).
@@ -101,6 +106,10 @@ fn parse_kek_bytes(raw: &[u8]) -> anyhow::Result<SecretVec<u8>> {
 }
 
 impl KmsProvider for LocalFileKms {
+    fn encrypt_dek(&self, plaintext_dek: &[u8]) -> anyhow::Result<Vec<u8>> {
+        LocalFileKms::encrypt_dek(self, plaintext_dek)
+    }
+
     fn decrypt_dek(&self, ciphertext: &[u8]) -> anyhow::Result<SecretVec<u8>> {
         if ciphertext.len() < NONCE_LEN + 16 {
             anyhow::bail!(

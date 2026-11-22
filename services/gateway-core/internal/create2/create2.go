@@ -99,6 +99,18 @@ func DeriveSalt(chainID types.ChainID, merchantID, orderID uuid.UUID) types.Hash
 	return crypto.Keccak256Hash(blob[:])
 }
 
+// DeriveUserSalt 计算交易所托管模型的用户专属 CREATE2 salt =
+// keccak256(abi.encode(uint256(chainId), bytes16(userId))) — 64B blob:
+// chainId 32B 大端 || userId 16B raw (UUID 原始字节, 无连字符) 左对齐右补零.
+// bytes16 右填充规则与 DeriveSalt 完全一致 — 严禁左填充 (那是 uintN 的规则),
+// 严禁 encodePacked 紧凑编码. 取代商户模型的 (merchantId, orderId) 双维度.
+func DeriveUserSalt(chainID types.ChainID, userID uuid.UUID) types.Hash {
+	var blob [64]byte // 32 + (16+16)
+	new(big.Int).SetUint64(uint64(chainID)).FillBytes(blob[0:32])
+	copy(blob[32:48], userID[:]) // bytes16: 高位对齐, [48:64] 保持 0x00
+	return crypto.Keccak256Hash(blob[:])
+}
+
 // DeriveAuthNonce 计算 EIP-3009 ReceiveWithAuthorization 的 nonce =
 // keccak256(abi.encode(chainId, salt)) = keccak256(chainId 32B BE || salt 32B).
 // 链上 Router 以同一公式自算强校验.

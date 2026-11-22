@@ -121,6 +121,77 @@ impl VaultSignerService for VaultSignerSvc {
         }))
     }
 
+    async fn generate_wallet(
+        &self,
+        request: Request<GenerateWalletRequest>,
+    ) -> Result<Response<GenerateWalletResponse>, Status> {
+        let req = request.into_inner();
+        let o = self.with_core(|c| c.generate_wallet(&req));
+        // The response message carries no reject fields by contract — a
+        // rejected call still lands a REJECTED entry on the audit chain
+        // (server-side reason); the caller sees the cause via gRPC status
+        // (INVALID_ARGUMENT for policy/input rejects, INTERNAL otherwise).
+        if !o.accepted {
+            return Err(if o.reject_code == RejectCode::Internal as i32 {
+                Status::internal(o.reason)
+            } else {
+                Status::invalid_argument(o.reason)
+            });
+        }
+        Ok(Response::new(GenerateWalletResponse {
+            address: o.address,
+            audit_seq: o.audit_seq,
+        }))
+    }
+
+    async fn update_cold_wallets(
+        &self,
+        request: Request<UpdateColdWalletsRequest>,
+    ) -> Result<Response<UpdateColdWalletsResponse>, Status> {
+        let req = request.into_inner();
+        let o = self.with_core(|c| c.update_cold_wallets(&req));
+        Ok(Response::new(UpdateColdWalletsResponse {
+            accepted: o.accepted,
+            reject_code: o.reject_code,
+            reason: o.reason,
+            audit_seq: o.audit_seq,
+            active_cold_wallets: o.active_cold_wallets,
+        }))
+    }
+
+    async fn list_wallets(
+        &self,
+        _request: Request<ListWalletsRequest>,
+    ) -> Result<Response<ListWalletsResponse>, Status> {
+        let rows = self
+            .with_core(|c| c.list_wallets())
+            .map_err(|e| Status::internal(format!("list_wallets: {e}")))?;
+        Ok(Response::new(ListWalletsResponse {
+            wallets: rows
+                .into_iter()
+                .map(|w| HotWalletInfo {
+                    address: w.address,
+                    label: w.label,
+                    created_at_unix: w.created_at_unix,
+                    loaded: w.loaded,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn list_cold_wallets(
+        &self,
+        request: Request<ListColdWalletsRequest>,
+    ) -> Result<Response<ListColdWalletsResponse>, Status> {
+        let req = request.into_inner();
+        let list = self
+            .with_core(|c| c.list_cold_wallets(req.chain_id))
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        Ok(Response::new(ListColdWalletsResponse {
+            active_cold_wallets: list,
+        }))
+    }
+
     async fn get_signer_health(
         &self,
         _request: Request<GetSignerHealthRequest>,

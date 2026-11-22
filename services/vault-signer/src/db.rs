@@ -8,6 +8,7 @@
 //!                             (FIX-C: replayed proofs can't resurrect REVOKED rows)
 //!   signer_intent_slots     — dual-field same-nonce idempotent auth slots
 //!   rolling_24h_usage       — sliding-window payout counter (circuit breaker)
+//!   cold_wallets            — runtime-administered COLD allowlist for SWEEP
 //!   audit_logs              — SHA-256 hash chain (see audit.rs)
 //!
 //! Concurrency model: a single `rusqlite::Connection` behind a `Mutex` in the
@@ -93,6 +94,19 @@ CREATE TABLE IF NOT EXISTS rolling_24h_usage (
 CREATE INDEX IF NOT EXISTS idx_usage_window
     ON rolling_24h_usage(chain_id, created_at);
 
+-- Dynamic COLD allowlist for the SWEEP policy. Bootstrap: at engine boot the
+-- chain's `allowed_cold_wallets` JSON config seeds the table iff the table
+-- has no rows for that chain; afterwards this table is the ONLY authority
+-- (UpdateColdWallets mutates it at runtime; config edits no longer apply).
+-- Rotation windows hold old+new addresses simultaneously, exactly as the
+-- frozen dual-track comment on ChainPolicyConfig.allowed_cold_wallets states.
+CREATE TABLE IF NOT EXISTS cold_wallets (
+    chain_id   INTEGER NOT NULL,
+    address    BLOB NOT NULL,               -- EVM raw20
+    created_at INTEGER NOT NULL,            -- unix seconds
+    PRIMARY KEY (chain_id, address)
+);
+
 CREATE TABLE IF NOT EXISTS audit_logs (
     seq            INTEGER PRIMARY KEY,       -- dense from 1
     timestamp_unix INTEGER NOT NULL,
@@ -172,6 +186,28 @@ fn init_conn(conn: &Connection) -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 // encrypted_keys
 // ---------------------------------------------------------------------------
+
+/// 热钱包元数据投影 — 不含 DEK 信封, ListWallets 专用.
+pub struct WalletKeyMeta {
+    pub wallet_address: String,
+    pub label: String,
+    pub created_at: i64,
+}
+
+pub fn list_wallet_key_meta(conn: &Connection) -> rusqlite::Result<Vec<WalletKeyMeta>> {
+    let mut stmt = conn.prepare(
+        "SELECT wallet_address, label, created_at FROM encrypted_keys
+          ORDER BY created_at, wallet_address",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(WalletKeyMeta {
+            wallet_address: r.get(0)?,
+            label: r.get(1)?,
+            created_at: r.get(2)?,
+        })
+    })?;
+    rows.collect()
+}
 
 pub fn load_encrypted_keys(conn: &Connection) -> rusqlite::Result<Vec<EncryptedKeyRow>> {
     let mut stmt = conn.prepare(
@@ -556,6 +592,92 @@ pub fn usage_insert(
 }
 
 // ---------------------------------------------------------------------------
+// cold_wallets (dynamic COLD allowlist — SWEEP policy authority)
+// ---------------------------------------------------------------------------
+
+/// Effective cold-wallet allowlist for `chain_id`, ascending raw-byte order
+/// (== ascending `0x` lowercase hex order at fixed 20B length — deterministic
+/// for the wire response). Malformed-length rows are skipped, not trusted.
+pub fn cold_wallets_list(conn: &Connection, chain_id: u64) -> rusqlite::Result<Vec<Address>> {
+    let mut stmt =
+        conn.prepare("SELECT address FROM cold_wallets WHERE chain_id=?1 ORDER BY address")?;
+    let rows = stmt.query_map(params![chain_id as i64], |r| r.get::<_, Vec<u8>>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        let raw = r?;
+        if raw.len() == 20 {
+            out.push(Address::from_slice(&raw));
+        }
+    }
+    Ok(out)
+}
+
+/// SWEEP firewall check: is `addr` a currently-allowed cold wallet?
+pub fn cold_wallet_allowed(
+    conn: &Connection,
+    chain_id: u64,
+    addr: &Address,
+) -> rusqlite::Result<bool> {
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cold_wallets WHERE chain_id=?1 AND address=?2",
+        params![chain_id as i64, addr.as_slice()],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
+}
+
+/// Idempotent add (UpdateColdWallets RPC is specified as idempotent).
+pub fn cold_wallet_add(
+    tx: &Transaction<'_>,
+    chain_id: u64,
+    addr: &Address,
+    now_unix: i64,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT OR IGNORE INTO cold_wallets(chain_id, address, created_at)
+         VALUES(?1,?2,?3)",
+        params![chain_id as i64, addr.as_slice(), now_unix],
+    )?;
+    Ok(())
+}
+
+/// Idempotent remove — returns rows actually deleted (0 on absent/no-op).
+pub fn cold_wallet_remove(
+    tx: &Transaction<'_>,
+    chain_id: u64,
+    addr: &Address,
+) -> rusqlite::Result<usize> {
+    tx.execute(
+        "DELETE FROM cold_wallets WHERE chain_id=?1 AND address=?2",
+        params![chain_id as i64, addr.as_slice()],
+    )
+}
+
+/// Boot seeding inside a caller-provided transaction: if `chain_id` has NO
+/// rows, insert `addrs` verbatim from config and return the count seeded;
+/// if any row exists the table is already authoritative — config is ignored
+/// and `0` is returned.
+pub fn seed_cold_wallets(
+    tx: &Transaction<'_>,
+    chain_id: u64,
+    addrs: &[Address],
+    now_unix: i64,
+) -> rusqlite::Result<usize> {
+    let n: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM cold_wallets WHERE chain_id=?1",
+        params![chain_id as i64],
+        |r| r.get(0),
+    )?;
+    if n > 0 {
+        return Ok(0);
+    }
+    for a in addrs {
+        cold_wallet_add(tx, chain_id, a, now_unix)?;
+    }
+    Ok(addrs.len())
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
@@ -564,7 +686,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schema_creates_six_tables() {
+    fn schema_creates_seven_tables() {
         let db = open_in_memory().unwrap();
         for t in [
             "encrypted_keys",
@@ -572,6 +694,7 @@ mod tests {
             "whitelist_lease_proofs",
             "signer_intent_slots",
             "rolling_24h_usage",
+            "cold_wallets",
             "audit_logs",
         ] {
             let n: i64 = db
@@ -749,5 +872,54 @@ mod tests {
             .remove(0);
         assert_eq!(row.valid_until, 9_000, "revived lease takes fresh admin bound");
         assert_eq!(row.first_seen_at, 5_000, "resurrection re-anchors cooldown");
+    }
+
+    /// cold_wallets: config seeds only while the table is empty (afterwards
+    /// DB is authoritative); add/remove are idempotent; the SWEEP lookup and
+    /// ordered list reflect runtime updates immediately.
+    #[test]
+    fn cold_wallets_seed_then_db_is_authoritative() {
+        let mut db = open_in_memory().unwrap();
+        let a = Address::from([0xA1u8; 20]);
+        let b = Address::from([0xB2u8; 20]);
+        let c = Address::from([0xC3u8; 20]);
+
+        // First boot: empty table -> config seeds verbatim.
+        {
+            let tx = db.conn.transaction().unwrap();
+            assert_eq!(seed_cold_wallets(&tx, 1, &[a, b], 1_000).unwrap(), 2);
+            tx.commit().unwrap();
+        }
+        assert_eq!(cold_wallets_list(&db.conn, 1).unwrap(), vec![a, b]);
+        assert!(cold_wallet_allowed(&db.conn, 1, &a).unwrap());
+        assert!(!cold_wallet_allowed(&db.conn, 1, &c).unwrap());
+
+        // Runtime update: remove a, add c. Idempotent on both sides.
+        {
+            let tx = db.conn.transaction().unwrap();
+            assert_eq!(cold_wallet_remove(&tx, 1, &a).unwrap(), 1);
+            assert_eq!(cold_wallet_remove(&tx, 1, &a).unwrap(), 0); // idempotent
+            cold_wallet_add(&tx, 1, &c, 2_000).unwrap();
+            cold_wallet_add(&tx, 1, &c, 3_000).unwrap(); // idempotent
+            tx.commit().unwrap();
+        }
+        assert_eq!(cold_wallets_list(&db.conn, 1).unwrap(), vec![b, c]);
+
+        // Re-"boot": rows exist -> config must NOT overwrite runtime state.
+        {
+            let tx = db.conn.transaction().unwrap();
+            assert_eq!(seed_cold_wallets(&tx, 1, &[a], 4_000).unwrap(), 0);
+            tx.commit().unwrap();
+        }
+        assert_eq!(cold_wallets_list(&db.conn, 1).unwrap(), vec![b, c]);
+
+        // Independent per chain_id.
+        {
+            let tx = db.conn.transaction().unwrap();
+            assert_eq!(seed_cold_wallets(&tx, 2, &[a], 5_000).unwrap(), 1);
+            tx.commit().unwrap();
+        }
+        assert!(cold_wallet_allowed(&db.conn, 2, &a).unwrap());
+        assert!(!cold_wallet_allowed(&db.conn, 1, &a).unwrap());
     }
 }

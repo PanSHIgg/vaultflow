@@ -28,6 +28,8 @@ pub mod actions {
     pub const REGISTER_WITHDRAWAL: &str = "REGISTER_WITHDRAWAL_ADDRESS";
     pub const REVOKE_WITHDRAWAL: &str = "REVOKE_WITHDRAWAL_ADDRESS";
     pub const SIGN_TRANSACTION: &str = "SIGN_TRANSACTION";
+    pub const GENERATE_WALLET: &str = "GENERATE_WALLET";
+    pub const UPDATE_COLD_WALLETS: &str = "UPDATE_COLD_WALLETS";
 }
 
 /// Canonical decision strings.

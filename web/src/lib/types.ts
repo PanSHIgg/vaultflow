@@ -49,10 +49,24 @@ export interface DepositPage {
 }
 
 export interface Balance {
-  chain_id: number;
   token_symbol: string;
   /** Atomic units (NUMERIC(78,0) decimal strings); display via `decimals`. */
   available: string;
   pending: string;
   decimals: number;
+}
+
+export interface Withdrawal {
+  id: string;
+  chain_id: number;
+  token_symbol: string;
+  token_contract: string;
+  to_address: string;
+  /** Atomic units (NUMERIC(78,0) decimal string). */
+  amount: string;
+  status: string;
+  tx_hash: string;
+  fail_reason: string;
+  created_at: string;
+  updated_at: string;
 }

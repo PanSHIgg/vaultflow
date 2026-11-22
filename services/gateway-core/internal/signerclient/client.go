@@ -405,6 +405,77 @@ func (c *Client) VerifyAuditChain(ctx context.Context, req ports.VerifyAuditChai
 	return out, nil
 }
 
+// GenerateWallet 请求 signer KMS 生成新平台钱包 (RELAYER/PAYOUT 等角色):
+// 私钥落 signer 侧 encrypted_keys, 本端仅回收地址. gRPC 错误统一包装.
+func (c *Client) GenerateWallet(ctx context.Context, chainID types.ChainID, role string) (types.Address, error) {
+	var resp *signerv1.GenerateWalletResponse
+	err := c.call(ctx, "GenerateWallet", func(rctx context.Context) error {
+		var e error
+		resp, e = c.api.GenerateWallet(rctx, &signerv1.GenerateWalletRequest{
+			ChainId: uint64(chainID),
+			Role:    role,
+		})
+		return e
+	})
+	if err != nil {
+		return types.Address{}, fmt.Errorf("signerclient: GenerateWallet: %w", err)
+	}
+	addr := resp.GetAddress()
+	if addr == "" {
+		return types.Address{}, fmt.Errorf("signerclient: GenerateWallet returned empty address (audit_seq=%d)",
+			resp.GetAuditSeq())
+	}
+	return types.HexToAddress(addr), nil
+}
+
+// ColdWalletsRejectedError UpdateColdWallets 被 signer 拒绝 (Accepted=false)
+// 的强类型错误 — errors.As 可提取 RejectCode/Reason/AuditSeq 供运维决策.
+type ColdWalletsRejectedError struct {
+	Code     ports.RejectCode
+	Reason   string
+	AuditSeq uint64
+}
+
+func (e *ColdWalletsRejectedError) Error() string {
+	return fmt.Sprintf("signerclient: UpdateColdWallets rejected: code=%d reason=%s audit_seq=%d",
+		e.Code, e.Reason, e.AuditSeq)
+}
+
+// UpdateColdWallets 增量更新 signer 动态冷钱包白名单 (add/remove 为 raw 20B).
+// Accepted=false 返回 *ColdWalletsRejectedError; 成功回传全量 ACTIVE 冷钱包.
+func (c *Client) UpdateColdWallets(ctx context.Context, chainID types.ChainID,
+	add, remove []types.Address) ([]types.Address, error) {
+
+	req := &signerv1.UpdateColdWalletsRequest{ChainId: uint64(chainID)}
+	for _, a := range add {
+		req.Add = append(req.Add, a.Bytes())
+	}
+	for _, a := range remove {
+		req.Remove = append(req.Remove, a.Bytes())
+	}
+	var resp *signerv1.UpdateColdWalletsResponse
+	err := c.call(ctx, "UpdateColdWallets", func(rctx context.Context) error {
+		var e error
+		resp, e = c.api.UpdateColdWallets(rctx, req)
+		return e
+	})
+	if err != nil {
+		return nil, fmt.Errorf("signerclient: UpdateColdWallets: %w", err)
+	}
+	if !resp.GetAccepted() {
+		return nil, &ColdWalletsRejectedError{
+			Code:     ports.RejectCode(resp.GetRejectCode()),
+			Reason:   resp.GetReason(),
+			AuditSeq: resp.GetAuditSeq(),
+		}
+	}
+	out := make([]types.Address, 0, len(resp.GetActiveColdWallets()))
+	for _, w := range resp.GetActiveColdWallets() {
+		out = append(out, types.HexToAddress(w))
+	}
+	return out, nil
+}
+
 // hexencode 0x 前缀小写 hex (与 §2.5.3 hex 编码规范一致).
 func hexencode(b []byte) string {
 	const hexdig = "0123456789abcdef"

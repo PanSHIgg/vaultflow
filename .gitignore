@@ -40,3 +40,5 @@ deploy/vault-signer
 *.log
 coverage/
 .DS_Store
+deploy/sepolia/
+deploy/signer-cli

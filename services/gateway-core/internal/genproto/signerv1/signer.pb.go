@@ -424,10 +424,14 @@ func (x *RevokeWithdrawalAddressResponse) GetAuditSeq() uint64 {
 
 // 客户异常退款票据:
 // signed_payload 为 127B 载荷:
-//
-//	"VAULTFLOW_REFUND_V1"(19B) || chain_id u64BE(8) || token_address(20)
-//	|| to_address(20) || exact_amount_u256(32B BE) || payout_uuid(16)
-//	|| retry_seq u32BE(4) || expiry_unix u64BE(8)
+//   "VAULTFLOW_REFUND_V1"(19B) || chain_id u64BE(8) || token_address(20)
+//   || to_address(20) || exact_amount_u256(32B BE) || payout_uuid(16)
+//   || retry_seq u32BE(4) || expiry_unix u64BE(8)
+// 语义固化 (FIX-C): 载荷内全部字段 (chain_id / token / to / exact_amount /
+// payout_uuid / retry_seq / expiry) 为唯一权威; signer 将载荷字段与本地
+// 解码的 EIP-1559 transfer(to, amount) 及 tx.to 逐字节比对, 请求体中的同名
+// 字段 (SignTransactionRequest.payout_uuid / retry_seq) 仅作一致性比对,
+// 绝不作为授权依据。
 type RefundTicket struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	SignedPayload  []byte                 `protobuf:"bytes,1,opt,name=signed_payload,json=signedPayload,proto3" json:"signed_payload,omitempty"`    // 127B
@@ -489,7 +493,8 @@ type SignTransactionRequest struct {
 	UnsignedTx []byte `protobuf:"bytes,2,opt,name=unsigned_tx,json=unsignedTx,proto3" json:"unsigned_tx,omitempty"`
 	// 调用方策略提示 (可省); signer 始终自行推导, 不一致时拒签。
 	PolicyHint TxPolicy `protobuf:"varint,3,opt,name=policy_hint,json=policyHint,proto3,enum=signer.v1.TxPolicy" json:"policy_hint,omitempty"`
-	// PAYOUT 策略必填: 幂等槽绑定的业务单号与重试序号。
+	// PAYOUT 策略必填: 幂等槽绑定的业务单号与重试序号。携带 RefundTicket 时
+	// 此二字段必须与票据载荷内值逐字节一致 (票据为唯一权威, 请求体仅作比对)。
 	PayoutUuid []byte `protobuf:"bytes,4,opt,name=payout_uuid,json=payoutUuid,proto3" json:"payout_uuid,omitempty"` // 16B UUID
 	RetrySeq   uint32 `protobuf:"varint,5,opt,name=retry_seq,json=retrySeq,proto3" json:"retry_seq,omitempty"`
 	// 客户异常退款时携带 (商户常规提现为空)。
@@ -1020,6 +1025,484 @@ func (x *GetSignerHealthResponse) GetLoadedWallets() []string {
 	return nil
 }
 
+type GenerateWalletRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ChainId       uint64                 `protobuf:"varint,1,opt,name=chain_id,json=chainId,proto3" json:"chain_id,omitempty"`
+	Role          string                 `protobuf:"bytes,2,opt,name=role,proto3" json:"role,omitempty"` // "RELAYER" | "PAYOUT"
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GenerateWalletRequest) Reset() {
+	*x = GenerateWalletRequest{}
+	mi := &file_signer_v1_signer_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GenerateWalletRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GenerateWalletRequest) ProtoMessage() {}
+
+func (x *GenerateWalletRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_signer_v1_signer_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GenerateWalletRequest.ProtoReflect.Descriptor instead.
+func (*GenerateWalletRequest) Descriptor() ([]byte, []int) {
+	return file_signer_v1_signer_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *GenerateWalletRequest) GetChainId() uint64 {
+	if x != nil {
+		return x.ChainId
+	}
+	return 0
+}
+
+func (x *GenerateWalletRequest) GetRole() string {
+	if x != nil {
+		return x.Role
+	}
+	return ""
+}
+
+type GenerateWalletResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Address       string                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"` // 0x 前缀小写 hex, 20B EVM 地址; 拒绝时为空并经 gRPC status 报错
+	AuditSeq      uint64                 `protobuf:"varint,2,opt,name=audit_seq,json=auditSeq,proto3" json:"audit_seq,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GenerateWalletResponse) Reset() {
+	*x = GenerateWalletResponse{}
+	mi := &file_signer_v1_signer_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GenerateWalletResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GenerateWalletResponse) ProtoMessage() {}
+
+func (x *GenerateWalletResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_signer_v1_signer_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GenerateWalletResponse.ProtoReflect.Descriptor instead.
+func (*GenerateWalletResponse) Descriptor() ([]byte, []int) {
+	return file_signer_v1_signer_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *GenerateWalletResponse) GetAddress() string {
+	if x != nil {
+		return x.Address
+	}
+	return ""
+}
+
+func (x *GenerateWalletResponse) GetAuditSeq() uint64 {
+	if x != nil {
+		return x.AuditSeq
+	}
+	return 0
+}
+
+type UpdateColdWalletsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ChainId       uint64                 `protobuf:"varint,1,opt,name=chain_id,json=chainId,proto3" json:"chain_id,omitempty"`
+	Add           [][]byte               `protobuf:"bytes,2,rep,name=add,proto3" json:"add,omitempty"`       // 待放行地址 (20B 原始字节)
+	Remove        [][]byte               `protobuf:"bytes,3,rep,name=remove,proto3" json:"remove,omitempty"` // 待移除地址 (20B 原始字节)
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpdateColdWalletsRequest) Reset() {
+	*x = UpdateColdWalletsRequest{}
+	mi := &file_signer_v1_signer_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateColdWalletsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateColdWalletsRequest) ProtoMessage() {}
+
+func (x *UpdateColdWalletsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_signer_v1_signer_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateColdWalletsRequest.ProtoReflect.Descriptor instead.
+func (*UpdateColdWalletsRequest) Descriptor() ([]byte, []int) {
+	return file_signer_v1_signer_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *UpdateColdWalletsRequest) GetChainId() uint64 {
+	if x != nil {
+		return x.ChainId
+	}
+	return 0
+}
+
+func (x *UpdateColdWalletsRequest) GetAdd() [][]byte {
+	if x != nil {
+		return x.Add
+	}
+	return nil
+}
+
+func (x *UpdateColdWalletsRequest) GetRemove() [][]byte {
+	if x != nil {
+		return x.Remove
+	}
+	return nil
+}
+
+type UpdateColdWalletsResponse struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Accepted bool                   `protobuf:"varint,1,opt,name=accepted,proto3" json:"accepted,omitempty"`
+	// 复用 RejectCode: db 错误 -> INTERNAL, 非法输入 -> POLICY_VIOLATION
+	RejectCode RejectCode `protobuf:"varint,2,opt,name=reject_code,json=rejectCode,proto3,enum=signer.v1.RejectCode" json:"reject_code,omitempty"`
+	Reason     string     `protobuf:"bytes,3,opt,name=reason,proto3" json:"reason,omitempty"`
+	AuditSeq   uint64     `protobuf:"varint,4,opt,name=audit_seq,json=auditSeq,proto3" json:"audit_seq,omitempty"`
+	// 更新后的生效冷钱包白名单 (0x 小写 hex)
+	ActiveColdWallets []string `protobuf:"bytes,5,rep,name=active_cold_wallets,json=activeColdWallets,proto3" json:"active_cold_wallets,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *UpdateColdWalletsResponse) Reset() {
+	*x = UpdateColdWalletsResponse{}
+	mi := &file_signer_v1_signer_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpdateColdWalletsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpdateColdWalletsResponse) ProtoMessage() {}
+
+func (x *UpdateColdWalletsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_signer_v1_signer_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpdateColdWalletsResponse.ProtoReflect.Descriptor instead.
+func (*UpdateColdWalletsResponse) Descriptor() ([]byte, []int) {
+	return file_signer_v1_signer_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *UpdateColdWalletsResponse) GetAccepted() bool {
+	if x != nil {
+		return x.Accepted
+	}
+	return false
+}
+
+func (x *UpdateColdWalletsResponse) GetRejectCode() RejectCode {
+	if x != nil {
+		return x.RejectCode
+	}
+	return RejectCode_REJECT_CODE_UNSPECIFIED
+}
+
+func (x *UpdateColdWalletsResponse) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+func (x *UpdateColdWalletsResponse) GetAuditSeq() uint64 {
+	if x != nil {
+		return x.AuditSeq
+	}
+	return 0
+}
+
+func (x *UpdateColdWalletsResponse) GetActiveColdWallets() []string {
+	if x != nil {
+		return x.ActiveColdWallets
+	}
+	return nil
+}
+
+type ListWalletsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListWalletsRequest) Reset() {
+	*x = ListWalletsRequest{}
+	mi := &file_signer_v1_signer_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListWalletsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListWalletsRequest) ProtoMessage() {}
+
+func (x *ListWalletsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_signer_v1_signer_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListWalletsRequest.ProtoReflect.Descriptor instead.
+func (*ListWalletsRequest) Descriptor() ([]byte, []int) {
+	return file_signer_v1_signer_proto_rawDescGZIP(), []int{17}
+}
+
+type HotWalletInfo struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Address       string                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`                                     // 0x 前缀小写 hex
+	Label         string                 `protobuf:"bytes,2,opt,name=label,proto3" json:"label,omitempty"`                                         // e.g. "role:RELAYER:chain:31337" / 部署期标签
+	CreatedAtUnix int64                  `protobuf:"varint,3,opt,name=created_at_unix,json=createdAtUnix,proto3" json:"created_at_unix,omitempty"` // 密钥登记时间 (signer 本地时钟)
+	Loaded        bool                   `protobuf:"varint,4,opt,name=loaded,proto3" json:"loaded,omitempty"`                                      // DEK 已装载内存 — 当前可用于签名
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *HotWalletInfo) Reset() {
+	*x = HotWalletInfo{}
+	mi := &file_signer_v1_signer_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *HotWalletInfo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*HotWalletInfo) ProtoMessage() {}
+
+func (x *HotWalletInfo) ProtoReflect() protoreflect.Message {
+	mi := &file_signer_v1_signer_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use HotWalletInfo.ProtoReflect.Descriptor instead.
+func (*HotWalletInfo) Descriptor() ([]byte, []int) {
+	return file_signer_v1_signer_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *HotWalletInfo) GetAddress() string {
+	if x != nil {
+		return x.Address
+	}
+	return ""
+}
+
+func (x *HotWalletInfo) GetLabel() string {
+	if x != nil {
+		return x.Label
+	}
+	return ""
+}
+
+func (x *HotWalletInfo) GetCreatedAtUnix() int64 {
+	if x != nil {
+		return x.CreatedAtUnix
+	}
+	return 0
+}
+
+func (x *HotWalletInfo) GetLoaded() bool {
+	if x != nil {
+		return x.Loaded
+	}
+	return false
+}
+
+type ListWalletsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Wallets       []*HotWalletInfo       `protobuf:"bytes,1,rep,name=wallets,proto3" json:"wallets,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListWalletsResponse) Reset() {
+	*x = ListWalletsResponse{}
+	mi := &file_signer_v1_signer_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListWalletsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListWalletsResponse) ProtoMessage() {}
+
+func (x *ListWalletsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_signer_v1_signer_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListWalletsResponse.ProtoReflect.Descriptor instead.
+func (*ListWalletsResponse) Descriptor() ([]byte, []int) {
+	return file_signer_v1_signer_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *ListWalletsResponse) GetWallets() []*HotWalletInfo {
+	if x != nil {
+		return x.Wallets
+	}
+	return nil
+}
+
+type ListColdWalletsRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ChainId       uint64                 `protobuf:"varint,1,opt,name=chain_id,json=chainId,proto3" json:"chain_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListColdWalletsRequest) Reset() {
+	*x = ListColdWalletsRequest{}
+	mi := &file_signer_v1_signer_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListColdWalletsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListColdWalletsRequest) ProtoMessage() {}
+
+func (x *ListColdWalletsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_signer_v1_signer_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListColdWalletsRequest.ProtoReflect.Descriptor instead.
+func (*ListColdWalletsRequest) Descriptor() ([]byte, []int) {
+	return file_signer_v1_signer_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *ListColdWalletsRequest) GetChainId() uint64 {
+	if x != nil {
+		return x.ChainId
+	}
+	return 0
+}
+
+type ListColdWalletsResponse struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	ActiveColdWallets []string               `protobuf:"bytes,1,rep,name=active_cold_wallets,json=activeColdWallets,proto3" json:"active_cold_wallets,omitempty"` // 0x 前缀小写 hex, 升序
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *ListColdWalletsResponse) Reset() {
+	*x = ListColdWalletsResponse{}
+	mi := &file_signer_v1_signer_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListColdWalletsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListColdWalletsResponse) ProtoMessage() {}
+
+func (x *ListColdWalletsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_signer_v1_signer_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListColdWalletsResponse.ProtoReflect.Descriptor instead.
+func (*ListColdWalletsResponse) Descriptor() ([]byte, []int) {
+	return file_signer_v1_signer_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *ListColdWalletsResponse) GetActiveColdWallets() []string {
+	if x != nil {
+		return x.ActiveColdWallets
+	}
+	return nil
+}
+
 var File_signer_v1_signer_proto protoreflect.FileDescriptor
 
 const file_signer_v1_signer_proto_rawDesc = "" +
@@ -1087,7 +1570,36 @@ const file_signer_v1_signer_proto_rawDesc = "" +
 	"\x11whitelist_entries\x18\x04 \x01(\rR\x10whitelistEntries\x12#\n" +
 	"\raudit_entries\x18\x05 \x01(\x04R\fauditEntries\x12$\n" +
 	"\x0eaudit_tip_hash\x18\x06 \x01(\fR\fauditTipHash\x12%\n" +
-	"\x0eloaded_wallets\x18\a \x03(\tR\rloadedWallets*\xf3\x02\n" +
+	"\x0eloaded_wallets\x18\a \x03(\tR\rloadedWallets\"F\n" +
+	"\x15GenerateWalletRequest\x12\x19\n" +
+	"\bchain_id\x18\x01 \x01(\x04R\achainId\x12\x12\n" +
+	"\x04role\x18\x02 \x01(\tR\x04role\"O\n" +
+	"\x16GenerateWalletResponse\x12\x18\n" +
+	"\aaddress\x18\x01 \x01(\tR\aaddress\x12\x1b\n" +
+	"\taudit_seq\x18\x02 \x01(\x04R\bauditSeq\"_\n" +
+	"\x18UpdateColdWalletsRequest\x12\x19\n" +
+	"\bchain_id\x18\x01 \x01(\x04R\achainId\x12\x10\n" +
+	"\x03add\x18\x02 \x03(\fR\x03add\x12\x16\n" +
+	"\x06remove\x18\x03 \x03(\fR\x06remove\"\xd4\x01\n" +
+	"\x19UpdateColdWalletsResponse\x12\x1a\n" +
+	"\baccepted\x18\x01 \x01(\bR\baccepted\x126\n" +
+	"\vreject_code\x18\x02 \x01(\x0e2\x15.signer.v1.RejectCodeR\n" +
+	"rejectCode\x12\x16\n" +
+	"\x06reason\x18\x03 \x01(\tR\x06reason\x12\x1b\n" +
+	"\taudit_seq\x18\x04 \x01(\x04R\bauditSeq\x12.\n" +
+	"\x13active_cold_wallets\x18\x05 \x03(\tR\x11activeColdWallets\"\x14\n" +
+	"\x12ListWalletsRequest\"\x7f\n" +
+	"\rHotWalletInfo\x12\x18\n" +
+	"\aaddress\x18\x01 \x01(\tR\aaddress\x12\x14\n" +
+	"\x05label\x18\x02 \x01(\tR\x05label\x12&\n" +
+	"\x0fcreated_at_unix\x18\x03 \x01(\x03R\rcreatedAtUnix\x12\x16\n" +
+	"\x06loaded\x18\x04 \x01(\bR\x06loaded\"I\n" +
+	"\x13ListWalletsResponse\x122\n" +
+	"\awallets\x18\x01 \x03(\v2\x18.signer.v1.HotWalletInfoR\awallets\"3\n" +
+	"\x16ListColdWalletsRequest\x12\x19\n" +
+	"\bchain_id\x18\x01 \x01(\x04R\achainId\"I\n" +
+	"\x17ListColdWalletsResponse\x12.\n" +
+	"\x13active_cold_wallets\x18\x01 \x03(\tR\x11activeColdWallets*\xf3\x02\n" +
 	"\n" +
 	"RejectCode\x12\x1b\n" +
 	"\x17REJECT_CODE_UNSPECIFIED\x10\x00\x12\x10\n" +
@@ -1113,13 +1625,17 @@ const file_signer_v1_signer_proto_rawDesc = "" +
 	"\n" +
 	"\x06PAYOUT\x10\x03\x12\x0e\n" +
 	"\n" +
-	"GAP_FILLER\x10\x042\x8f\x04\n" +
+	"GAP_FILLER\x10\x042\xee\x06\n" +
 	"\x12VaultSignerService\x12v\n" +
 	"\x19RegisterWithdrawalAddress\x12+.signer.v1.RegisterWithdrawalAddressRequest\x1a,.signer.v1.RegisterWithdrawalAddressResponse\x12p\n" +
 	"\x17RevokeWithdrawalAddress\x12).signer.v1.RevokeWithdrawalAddressRequest\x1a*.signer.v1.RevokeWithdrawalAddressResponse\x12X\n" +
 	"\x0fSignTransaction\x12!.signer.v1.SignTransactionRequest\x1a\".signer.v1.SignTransactionResponse\x12[\n" +
 	"\x10VerifyAuditChain\x12\".signer.v1.VerifyAuditChainRequest\x1a#.signer.v1.VerifyAuditChainResponse\x12X\n" +
-	"\x0fGetSignerHealth\x12!.signer.v1.GetSignerHealthRequest\x1a\".signer.v1.GetSignerHealthResponseB3Z1vaultflow/gateway-core/internal/genproto/signerv1b\x06proto3"
+	"\x0fGetSignerHealth\x12!.signer.v1.GetSignerHealthRequest\x1a\".signer.v1.GetSignerHealthResponse\x12U\n" +
+	"\x0eGenerateWallet\x12 .signer.v1.GenerateWalletRequest\x1a!.signer.v1.GenerateWalletResponse\x12^\n" +
+	"\x11UpdateColdWallets\x12#.signer.v1.UpdateColdWalletsRequest\x1a$.signer.v1.UpdateColdWalletsResponse\x12L\n" +
+	"\vListWallets\x12\x1d.signer.v1.ListWalletsRequest\x1a\x1e.signer.v1.ListWalletsResponse\x12X\n" +
+	"\x0fListColdWallets\x12!.signer.v1.ListColdWalletsRequest\x1a\".signer.v1.ListColdWalletsResponseB3Z1vaultflow/gateway-core/internal/genproto/signerv1b\x06proto3"
 
 var (
 	file_signer_v1_signer_proto_rawDescOnce sync.Once
@@ -1134,7 +1650,7 @@ func file_signer_v1_signer_proto_rawDescGZIP() []byte {
 }
 
 var file_signer_v1_signer_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_signer_v1_signer_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_signer_v1_signer_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
 var file_signer_v1_signer_proto_goTypes = []any{
 	(RejectCode)(0),                           // 0: signer.v1.RejectCode
 	(TxPolicy)(0),                             // 1: signer.v1.TxPolicy
@@ -1151,6 +1667,15 @@ var file_signer_v1_signer_proto_goTypes = []any{
 	(*VerifyAuditChainResponse)(nil),          // 12: signer.v1.VerifyAuditChainResponse
 	(*GetSignerHealthRequest)(nil),            // 13: signer.v1.GetSignerHealthRequest
 	(*GetSignerHealthResponse)(nil),           // 14: signer.v1.GetSignerHealthResponse
+	(*GenerateWalletRequest)(nil),             // 15: signer.v1.GenerateWalletRequest
+	(*GenerateWalletResponse)(nil),            // 16: signer.v1.GenerateWalletResponse
+	(*UpdateColdWalletsRequest)(nil),          // 17: signer.v1.UpdateColdWalletsRequest
+	(*UpdateColdWalletsResponse)(nil),         // 18: signer.v1.UpdateColdWalletsResponse
+	(*ListWalletsRequest)(nil),                // 19: signer.v1.ListWalletsRequest
+	(*HotWalletInfo)(nil),                     // 20: signer.v1.HotWalletInfo
+	(*ListWalletsResponse)(nil),               // 21: signer.v1.ListWalletsResponse
+	(*ListColdWalletsRequest)(nil),            // 22: signer.v1.ListColdWalletsRequest
+	(*ListColdWalletsResponse)(nil),           // 23: signer.v1.ListColdWalletsResponse
 }
 var file_signer_v1_signer_proto_depIdxs = []int32{
 	0,  // 0: signer.v1.RegisterWithdrawalAddressResponse.reject_code:type_name -> signer.v1.RejectCode
@@ -1160,21 +1685,31 @@ var file_signer_v1_signer_proto_depIdxs = []int32{
 	0,  // 4: signer.v1.Rejection.code:type_name -> signer.v1.RejectCode
 	8,  // 5: signer.v1.SignTransactionResponse.signed:type_name -> signer.v1.SignedTx
 	9,  // 6: signer.v1.SignTransactionResponse.rejected:type_name -> signer.v1.Rejection
-	2,  // 7: signer.v1.VaultSignerService.RegisterWithdrawalAddress:input_type -> signer.v1.RegisterWithdrawalAddressRequest
-	4,  // 8: signer.v1.VaultSignerService.RevokeWithdrawalAddress:input_type -> signer.v1.RevokeWithdrawalAddressRequest
-	7,  // 9: signer.v1.VaultSignerService.SignTransaction:input_type -> signer.v1.SignTransactionRequest
-	11, // 10: signer.v1.VaultSignerService.VerifyAuditChain:input_type -> signer.v1.VerifyAuditChainRequest
-	13, // 11: signer.v1.VaultSignerService.GetSignerHealth:input_type -> signer.v1.GetSignerHealthRequest
-	3,  // 12: signer.v1.VaultSignerService.RegisterWithdrawalAddress:output_type -> signer.v1.RegisterWithdrawalAddressResponse
-	5,  // 13: signer.v1.VaultSignerService.RevokeWithdrawalAddress:output_type -> signer.v1.RevokeWithdrawalAddressResponse
-	10, // 14: signer.v1.VaultSignerService.SignTransaction:output_type -> signer.v1.SignTransactionResponse
-	12, // 15: signer.v1.VaultSignerService.VerifyAuditChain:output_type -> signer.v1.VerifyAuditChainResponse
-	14, // 16: signer.v1.VaultSignerService.GetSignerHealth:output_type -> signer.v1.GetSignerHealthResponse
-	12, // [12:17] is the sub-list for method output_type
-	7,  // [7:12] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	0,  // 7: signer.v1.UpdateColdWalletsResponse.reject_code:type_name -> signer.v1.RejectCode
+	20, // 8: signer.v1.ListWalletsResponse.wallets:type_name -> signer.v1.HotWalletInfo
+	2,  // 9: signer.v1.VaultSignerService.RegisterWithdrawalAddress:input_type -> signer.v1.RegisterWithdrawalAddressRequest
+	4,  // 10: signer.v1.VaultSignerService.RevokeWithdrawalAddress:input_type -> signer.v1.RevokeWithdrawalAddressRequest
+	7,  // 11: signer.v1.VaultSignerService.SignTransaction:input_type -> signer.v1.SignTransactionRequest
+	11, // 12: signer.v1.VaultSignerService.VerifyAuditChain:input_type -> signer.v1.VerifyAuditChainRequest
+	13, // 13: signer.v1.VaultSignerService.GetSignerHealth:input_type -> signer.v1.GetSignerHealthRequest
+	15, // 14: signer.v1.VaultSignerService.GenerateWallet:input_type -> signer.v1.GenerateWalletRequest
+	17, // 15: signer.v1.VaultSignerService.UpdateColdWallets:input_type -> signer.v1.UpdateColdWalletsRequest
+	19, // 16: signer.v1.VaultSignerService.ListWallets:input_type -> signer.v1.ListWalletsRequest
+	22, // 17: signer.v1.VaultSignerService.ListColdWallets:input_type -> signer.v1.ListColdWalletsRequest
+	3,  // 18: signer.v1.VaultSignerService.RegisterWithdrawalAddress:output_type -> signer.v1.RegisterWithdrawalAddressResponse
+	5,  // 19: signer.v1.VaultSignerService.RevokeWithdrawalAddress:output_type -> signer.v1.RevokeWithdrawalAddressResponse
+	10, // 20: signer.v1.VaultSignerService.SignTransaction:output_type -> signer.v1.SignTransactionResponse
+	12, // 21: signer.v1.VaultSignerService.VerifyAuditChain:output_type -> signer.v1.VerifyAuditChainResponse
+	14, // 22: signer.v1.VaultSignerService.GetSignerHealth:output_type -> signer.v1.GetSignerHealthResponse
+	16, // 23: signer.v1.VaultSignerService.GenerateWallet:output_type -> signer.v1.GenerateWalletResponse
+	18, // 24: signer.v1.VaultSignerService.UpdateColdWallets:output_type -> signer.v1.UpdateColdWalletsResponse
+	21, // 25: signer.v1.VaultSignerService.ListWallets:output_type -> signer.v1.ListWalletsResponse
+	23, // 26: signer.v1.VaultSignerService.ListColdWallets:output_type -> signer.v1.ListColdWalletsResponse
+	18, // [18:27] is the sub-list for method output_type
+	9,  // [9:18] is the sub-list for method input_type
+	9,  // [9:9] is the sub-list for extension type_name
+	9,  // [9:9] is the sub-list for extension extendee
+	0,  // [0:9] is the sub-list for field type_name
 }
 
 func init() { file_signer_v1_signer_proto_init() }
@@ -1192,7 +1727,7 @@ func file_signer_v1_signer_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_signer_v1_signer_proto_rawDesc), len(file_signer_v1_signer_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   13,
+			NumMessages:   22,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -3,7 +3,6 @@ package indexer
 import (
 	"context"
 	"fmt"
-	"time"
 
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/google/uuid"
@@ -11,7 +10,7 @@ import (
 	"go.uber.org/zap"
 
 	"vaultflow/gateway-core/internal/chain"
-	"vaultflow/gateway-core/internal/ports"
+	"vaultflow/gateway-core/internal/store"
 	"vaultflow/gateway-core/internal/types"
 )
 
@@ -49,34 +48,23 @@ func addrStr(a types.Address) string {
 	return string(out)
 }
 
-// orderInfo deposit_address → 订单关联快照 (分类与结算用).
-type orderInfo struct {
-	orderID        uuid.UUID
-	depositAddrID  uuid.UUID
-	merchantID     uuid.UUID
-	assetSymbol    string
-	tokenContract  types.Address // 订单应付币种合约 (supported_assets 反查)
-	expectedAmount types.U256
-	receivedAmount types.U256
-	status         types.OrderStatus
-	expiresAt      time.Time
-	feeRateBps     int64
-	quarantined    bool
-}
-
-// chainView 单 tick 的链配置快照: 白名单代币、watch 集合、vault→订单映射.
+// chainView 单 tick 的链配置快照: 白名单代币、watch 集合、
+// vault→用户地址行映射与 ACTIVE 平台钱包角色映射.
 type chainView struct {
-	tokenSymbols map[types.Address]string     // token_contract -> asset_symbol
-	tokenList    []types.Address              // 白名单代币合约 (getLogs address filter)
-	watch        []types.Address              // 监控地址全集 (vaults + 双热钱包)
-	orders       map[types.Address]*orderInfo // deposit vault address -> order
+	tokenSymbols map[types.Address]string                   // token_contract -> asset_symbol
+	tokenList    []types.Address                            // 白名单代币合约 (getLogs address filter)
+	watch        []types.Address                            // 监控地址全集 (用户 vaults + ACTIVE 平台钱包)
+	users        map[types.Address]store.UserDepositAddress // vault address -> 归属用户行
+	platformRole map[types.Address]string                   // ACTIVE platform wallet address -> role
 }
 
-// loadChainView 拉取本链 supported_assets + deposit_addresses+orders+merchant 视图.
+// loadChainView 拉取本链 supported_assets + user_deposit_addresses +
+// ACTIVE platform_wallets 视图 — 每块刷新, admin 平台钱包 CRUD 无重启生效.
 func (ix *Indexer) loadChainView(ctx context.Context) (*chainView, error) {
 	cv := &chainView{
 		tokenSymbols: map[types.Address]string{},
-		orders:       map[types.Address]*orderInfo{},
+		users:        map[types.Address]store.UserDepositAddress{},
+		platformRole: map[types.Address]string{},
 	}
 	rows, err := ix.db.Query(ctx,
 		`SELECT token_contract, asset_symbol FROM supported_assets WHERE chain_id=$1`,
@@ -96,55 +84,53 @@ func (ix *Indexer) loadChainView(ctx context.Context) (*chainView, error) {
 	}
 	rows.Close()
 
+	// 用户充值地址全集 — watch 过滤 + USER_DEPOSIT 归属反查
+	// (语义等价 store.LookupUserByAddress, 批量预载免逐事件往返).
 	rows, err = ix.db.Query(ctx,
-		`SELECT da.id, da.address, da.is_quarantined,
-		        po.id, po.merchant_id, po.asset_symbol, po.expected_amount::text,
-		        po.received_amount::text, po.status, po.expires_at, m.fee_rate_bps
-		   FROM deposit_addresses da
-		   JOIN payment_orders po ON po.deposit_address_id = da.id
-		   JOIN merchants m ON m.id = po.merchant_id
-		  WHERE da.chain_id=$1`, int64(ix.cfg.ChainID))
+		`SELECT id, user_id, address, is_deployed, is_quarantined
+		   FROM user_deposit_addresses WHERE chain_id=$1`, int64(ix.cfg.ChainID))
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	seen := map[types.Address]bool{}
 	for rows.Next() {
-		var oi orderInfo
-		var addr, exp, recv string
-		if err := rows.Scan(&oi.depositAddrID, &addr, &oi.quarantined,
-			&oi.orderID, &oi.merchantID, &oi.assetSymbol, &exp, &recv,
-			&oi.status, &oi.expiresAt, &oi.feeRateBps); err != nil {
+		var uda store.UserDepositAddress
+		var addr string
+		if err := rows.Scan(&uda.ID, &uda.UserID, &addr,
+			&uda.IsDeployed, &uda.IsQuarantined); err != nil {
+			rows.Close()
 			return nil, err
 		}
-		va := types.HexToAddress(addr)
-		oi.expectedAmount = types.MustParseU256(exp)
-		oi.receivedAmount = types.MustParseU256(recv)
-		cv.orders[va] = &oi
-		if !seen[va] {
-			seen[va] = true
-			cv.watch = append(cv.watch, va)
+		uda.ChainID = ix.cfg.ChainID
+		uda.Address = types.HexToAddress(addr)
+		cv.users[uda.Address] = uda
+		if !seen[uda.Address] {
+			seen[uda.Address] = true
+			cv.watch = append(cv.watch, uda.Address)
 		}
 	}
-	// §4.1: 过滤集合永含 payout_hot_wallet 与 relayer_hot_wallet
-	// (自动识别冷热调拨与外部注资 — 分支 A).
-	for _, w := range []types.Address{ix.cfg.PayoutHotWallet, ix.cfg.RelayerHotWallet} {
-		if w != (types.Address{}) && !seen[w] {
-			seen[w] = true
-			cv.watch = append(cv.watch, w)
-		}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
-	return cv, rows.Err()
-}
 
-// orderToken 订单应付币种合约地址 (按 asset_symbol 反查 supported_assets).
-func (cv *chainView) orderToken(oi *orderInfo) (types.Address, bool) {
-	for tc, sym := range cv.tokenSymbols {
-		if sym == oi.assetSymbol {
-			return tc, true
+	// ACTIVE 平台钱包 — COLD=TREASURY_REBALANCE / RELAYER,PAYOUT=TOPUP 分类 +
+	// watch 常驻 (热钱包注资与冷金库调拨识别).
+	wallets, err := ix.st.ListPlatformWallets(ctx, &ix.cfg.ChainID)
+	if err != nil {
+		return nil, err
+	}
+	for _, w := range wallets {
+		if w.Status != store.WalletStatusActive {
+			continue
+		}
+		cv.platformRole[w.Address] = w.Role
+		if !seen[w.Address] {
+			seen[w.Address] = true
+			cv.watch = append(cv.watch, w.Address)
 		}
 	}
-	return types.Address{}, false
+	return cv, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -158,14 +144,13 @@ func (ix *Indexer) processBlock(ctx context.Context, hdr *chain.BlockHeader) err
 	if err != nil {
 		return err
 	}
-	// 拉取该块监控地址的 Transfer 日志 (A1: 按 canonical block hash 钉死,
+	// 拉取该块监控地址的 Transfer 日志 (按 canonical block hash 钉死,
 	// 网络 I/O 在事务外).
 	evs, err := ix.chain.TransferLogs(ctx, hdr, cv.tokenList, cv.watch, ix.cfg.MaxFilterAddrs)
 	if err != nil {
 		return fmt.Errorf("indexer: fetch logs block %d: %w", hdr.Number, err)
 	}
 
-	var after []func() // FIX-G BUG-2: 提交后 SSE 发布器 — 绝不先发后提
 	err = pgx.BeginFunc(ctx, ix.db, func(tx pgx.Tx) error {
 		// chain_blocks: 孤儿块哈希在新主链复现时复活为 CANONICAL (极端 re-reorg 边
 		// 界; 同高度旧块已由 LIFO 先行 ORPHANED, 高度唯一索引不冲突).
@@ -181,32 +166,24 @@ func (ix *Indexer) processBlock(ctx context.Context, hdr *chain.BlockHeader) err
 
 		for _, ev := range evs {
 			if ev.BlockHash != hdr.Hash {
-				// A1 双保险: 钉死语义由 Pool 保证, ChainQuerier 实现回归时
+				// 双保险: 钉死语义由 Pool 保证, ChainQuerier 实现回归时
 				// 异哈希日志在此兜底剔除, 绝不入 canonical 流水.
 				ix.log.Warn("drop non-canonical blockHash log",
 					zap.String("want", hashStr(hdr.Hash)), zap.String("got", hashStr(ev.BlockHash)),
 					zap.String("tx", hashStr(ev.TxHash)))
 				continue
 			}
-			cat, orderID := ix.classify(ev, cv)
-			if cat == "" {
-				continue // watch 集合外地址 (防御 — 正常不会发生)
+			cat, userID := ix.classify(ev, cv)
+			var uid *uuid.UUID
+			if userID != uuid.Nil {
+				uid = &userID
 			}
-			oi := orderInfoAt(cv, ev.To)
-			var matched *uuid.UUID
-			if orderID != uuid.Nil {
-				matched = &orderID
-			} else if oi != nil && cat != types.DepositCategoryTopup && cat != types.DepositCategoryTreasuryRebalance {
-				// WRONG_ASSET/POST_TERMINAL 仍关联订单供运营观测 (matched_order_id 可空列).
-				matched = &oi.orderID
-			}
-			// 孤儿块哈希复活 (极端边界): 既有 ORPHANED_* 记录重捕为 DETECTED,
-			// 结算侧按周期引用幂等防重复记账.
+			// 孤儿块哈希复活 (极端边界): 既有 ORPHANED_* 记录重捕为 DETECTED.
 			if _, err := tx.Exec(ctx,
 				`INSERT INTO onchain_deposits
 				   (chain_id, block_hash, tx_hash, log_index, block_number,
 				    token_contract, from_address, to_address, amount,
-				    deposit_category, status, matched_order_id)
+				    deposit_category, status, user_id)
 				 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::numeric,$10,'DETECTED',$11)
 				 ON CONFLICT (chain_id, block_hash, tx_hash, log_index) DO UPDATE
 				   SET status='DETECTED'
@@ -214,18 +191,8 @@ func (ix *Indexer) processBlock(ctx context.Context, hdr *chain.BlockHeader) err
 				int64(ix.cfg.ChainID), hashStr(ev.BlockHash), hashStr(ev.TxHash),
 				int64(ev.LogIndex), int64(ev.BlockNumber),
 				addrStr(ev.TokenContract), addrStr(ev.From), addrStr(ev.To),
-				ev.Amount.String(), string(cat), matched); err != nil {
+				ev.Amount.String(), cat, uid); err != nil {
 				return err
-			}
-			if matched != nil {
-				// FIX-G BUG-2: 订单关联充值捕获 — 提交后广播 block_detected
-				// (TOPUP/REBALANCE 无订单不发; 孤儿复活重捕亦属真检测).
-				oid := *matched
-				after = append(after, func() {
-					ix.publishOrderEvent(ctx, ports.OrderEvent{
-						OrderID: oid, Type: ports.OrderEventDepositDetected,
-						OccurredAt: ix.now()})
-				})
 			}
 		}
 
@@ -237,44 +204,29 @@ func (ix *Indexer) processBlock(ctx context.Context, hdr *chain.BlockHeader) err
 			int64(ix.cfg.ChainID), int64(hdr.Number), hashStr(hdr.Hash))
 		return err
 	})
-	if err != nil {
-		return err
-	}
-	for _, fn := range after {
-		fn()
-	}
-	return nil
+	return err
 }
 
-// classify §4.1 四分支入站分类 (detect 期快照; finalize 期对 ORDER_MATCH
-// 边界做二次复核 — 订单状态可能在等待 safe_head 期间跃迁).
-func (ix *Indexer) classify(ev chain.TransferEvent, cv *chainView) (types.DepositCategory, uuid.UUID) {
-	// 分支 A: 热钱包入金 — 内部金库调拨或外部注资.
-	if ev.To == ix.cfg.PayoutHotWallet || ev.To == ix.cfg.RelayerHotWallet {
-		// A5: from ∈ 冷金库集合 (ColdWallet ∪ ColdWallets, 含轮换期新旧并存).
-		if ix.isColdWallet(ev.From) {
-			return types.DepositCategoryTreasuryRebalance, uuid.Nil
+// classify 入站分类 (交易所托管模型):
+//
+//  1. to_address ∈ user_deposit_addresses -> USER_DEPOSIT + user_id;
+//  2. to_address ∈ ACTIVE platform_wallets -> COLD=TREASURY_REBALANCE,
+//     RELAYER/PAYOUT=TOPUP;
+//  3. 否则 UNMATCHED (watch 集合外来宾转账, 供运营对账观测).
+//
+// 返回 (deposit_category, user_id); 非 USER_DEPOSIT 时 user_id == uuid.Nil.
+func (ix *Indexer) classify(ev chain.TransferEvent, cv *chainView) (string, uuid.UUID) {
+	if uda, ok := cv.users[ev.To]; ok {
+		return store.DepositCategoryUserDeposit, uda.UserID
+	}
+	if role, ok := cv.platformRole[ev.To]; ok {
+		if role == store.WalletRoleCold {
+			return store.DepositCategoryTreasuryRebalance, uuid.Nil
 		}
-		return types.DepositCategoryTopup, uuid.Nil
+		return store.DepositCategoryTopup, uuid.Nil // RELAYER / PAYOUT
 	}
-	oi := cv.orders[ev.To]
-	if oi == nil {
-		// 不在视图内的收款地址 — 过滤集合外的转账, 跳过入库由调用方忽略.
-		return "", uuid.Nil
-	}
-	// 分支 B: 异币误充 (token_contract != 订单应付币种合约).
-	if want, ok := cv.orderToken(oi); ok && ev.TokenContract != want {
-		return types.DepositCategoryWrongAsset, oi.orderID
-	}
-	// 分支 C: 终态订单二次误充 (业务完结语义终态).
-	if oi.status.IsBusinessTerminal() {
-		return types.DepositCategoryPostTerminal, oi.orderID
-	}
-	// 分支 D: 活跃/挂起订单正常入账.
-	return types.DepositCategoryOrderMatch, oi.orderID
+	return store.DepositCategoryUnmatched, uuid.Nil
 }
-
-func orderInfoAt(cv *chainView, a types.Address) *orderInfo { return cv.orders[a] }
 
 // ---------------------------------------------------------------------------
 // 出站入块检测: BROADCASTED -> INCLUDED_UNSAFE (+ 兄弟 SUPERSEDED)

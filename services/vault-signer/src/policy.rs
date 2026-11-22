@@ -12,6 +12,8 @@
 //!       uint256,uint256,bytes32,uint8,bytes32,bytes32)
 //!   ERC20.transfer(address,uint256)  — selector 0xa9059cbb
 
+use std::collections::BTreeSet;
+
 use alloy_primitives::{keccak256, Address, B256, U256};
 
 use crate::crypto::DecodedUnsignedTx;
@@ -20,7 +22,8 @@ use crate::crypto::DecodedUnsignedTx;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
     /// relayer -> BatchSweeper.deployAndSweepBatch; decoded targetColdWallet
-    /// must sit in `allowed_cold_wallets` (dual-track during 48h rotation).
+    /// must sit in the signer's dynamic `cold_wallets` table — membership is
+    /// enforced by the engine (DB-authoritative), not by this pure decoder.
     Sweep,
     /// relayer -> EIP3009PayRouter.payOrderWithAuthorization; signer locally
     /// verifies authNonce == keccak256(abi.encode(chain_id, salt)).
@@ -110,7 +113,10 @@ pub struct ChainPolicyConfig {
     pub eip3009_router: Address,
     /// Whitelisted custody stablecoin contracts (PAYOUT `to` allowlist).
     pub custody_tokens: Vec<Address>,
-    /// Allowed cold wallets; holds old+new pair during 48h rotation windows.
+    /// Bootstrap seed for the `cold_wallets` SQLite table (applied iff the
+    /// table is empty for the chain). Once seeded the DB is the ONLY
+    /// authority — this field is never consulted at sign time. Holds old+new
+    /// pair during 48h rotation windows at first boot.
     pub allowed_cold_wallets: Vec<Address>,
     /// Whitelist cooldown (default 24h; test envs may explicitly override).
     pub cooldown_secs: u64,
@@ -148,7 +154,7 @@ pub struct ClassifiedTx {
     /// The hot wallet whose DEK signs — forced by policy, never by request:
     ///   SWEEP / EIP3009_RELAY -> cfg.relayer_hot_wallet
     ///   PAYOUT                -> cfg.payout_hot_wallet
-    ///   GAP_FILLER            -> tx.to (self-transfer of a configured wallet)
+    ///   GAP_FILLER            -> tx.to (self-transfer of a hot wallet)
     pub from: Address,
     pub outcome: PolicyOutcome,
 }
@@ -310,18 +316,24 @@ pub fn expected_auth_nonce(chain_id: u64, salt: &B256) -> B256 {
 ///   custody token        -> PAYOUT
 ///   a hot wallet (self)  -> GAP_FILLER
 ///   anything else        -> UNKNOWN_POLICY
+///
+/// `hot_wallets` is the engine-supplied set of signer-custodied hot wallets
+/// (configured relayer/payout ∪ every DEK loaded into memory — including
+/// runtime-provisioned GenerateWallet keys, which are live without restart).
+/// Cold-wallet membership for SWEEP is deliberately NOT checked here: the
+/// allowlist lives in the `cold_wallets` SQLite table and the engine consults
+/// it inside the signing transaction so runtime updates take effect
+/// immediately. This function stays a pure decoder/validator.
 pub fn classify(
     cfg: &ChainPolicyConfig,
     tx: &DecodedUnsignedTx,
+    hot_wallets: &BTreeSet<Address>,
 ) -> Result<ClassifiedTx, PolicyError> {
     if tx.to == cfg.batch_sweeper {
         if !tx.value.is_zero() {
             return Err(PolicyError::Violation("SWEEP requires value == 0"));
         }
         let (token, target, item_count) = decode_deploy_and_sweep_batch(&tx.data)?;
-        if !cfg.allowed_cold_wallets.contains(&target) {
-            return Err(PolicyError::ColdWalletNotAllowed);
-        }
         return Ok(ClassifiedTx {
             policy: Policy::Sweep,
             from: cfg.relayer_hot_wallet,
@@ -370,7 +382,7 @@ pub fn classify(
         });
     }
 
-    if tx.to == cfg.relayer_hot_wallet || tx.to == cfg.payout_hot_wallet {
+    if hot_wallets.contains(&tx.to) {
         if !tx.is_gap_filler(&tx.to) {
             return Err(PolicyError::Violation(
                 "GAP_FILLER requires to==from, value==0, empty data, gas==21000",
@@ -393,6 +405,15 @@ pub fn classify(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Engine-supplied hot-wallet set: configured relayer/payout ∪ loaded
+    /// DEKs. Unit tests only need the configured pair.
+    fn hot() -> BTreeSet<Address> {
+        let c = cfg();
+        [c.relayer_hot_wallet, c.payout_hot_wallet]
+            .into_iter()
+            .collect()
+    }
 
     fn cfg() -> ChainPolicyConfig {
         ChainPolicyConfig {
@@ -453,7 +474,7 @@ mod tests {
         data.extend_from_slice(&u256_word(1_500_000));
 
         let t = tx([0xAAu8; 20], data);
-        let c = classify(&cfg(), &t).unwrap();
+        let c = classify(&cfg(), &t, &hot()).unwrap();
         assert_eq!(c.policy, Policy::Sweep);
         assert_eq!(c.from, cfg().relayer_hot_wallet);
         match c.outcome {
@@ -466,20 +487,27 @@ mod tests {
         }
     }
 
+    /// Membership against the dynamic `cold_wallets` table is enforced by the
+    /// ENGINE inside the signing transaction — `classify` itself only decodes
+    /// and field-validates, so an arbitrary target address still classifies as
+    /// SWEEP here (engine-level tests cover COLD_WALLET_NOT_ALLOWED).
     #[test]
-    fn sweep_rejects_tampered_cold_wallet() {
+    fn sweep_classifies_before_cold_membership_check() {
         let sel = selector("deployAndSweepBatch((bytes32,uint256)[],address,address)");
         let mut data = Vec::new();
         data.extend_from_slice(&sel);
         data.extend_from_slice(&u256_word(96));
         data.extend_from_slice(&addr_word([0x44u8; 20]));
-        data.extend_from_slice(&addr_word([0xEEu8; 20])); // attacker wallet
+        data.extend_from_slice(&addr_word([0xEEu8; 20])); // not in any allowlist
         data.extend_from_slice(&u256_word(0));
         let t = tx([0xAAu8; 20], data);
-        assert_eq!(
-            classify(&cfg(), &t).unwrap_err(),
-            PolicyError::ColdWalletNotAllowed
-        );
+        let c = classify(&cfg(), &t, &hot()).unwrap();
+        match c.outcome {
+            PolicyOutcome::Sweep { target_cold_wallet, .. } => {
+                assert_eq!(target_cold_wallet, Address::from([0xEEu8; 20]));
+            }
+            _ => panic!("expected SWEEP classification"),
+        }
     }
 
     #[test]
@@ -518,7 +546,7 @@ mod tests {
         let salt = B256::from([0xABu8; 32]);
         let nonce = expected_auth_nonce(31337, &salt);
         let t = tx([0xBBu8; 20], relay_calldata(&salt, &nonce));
-        let c = classify(&cfg(), &t).unwrap();
+        let c = classify(&cfg(), &t, &hot()).unwrap();
         assert_eq!(c.policy, Policy::Eip3009Relay);
         assert_eq!(c.from, cfg().relayer_hot_wallet);
     }
@@ -531,7 +559,7 @@ mod tests {
         let nonce = expected_auth_nonce(31337, &salt);
         let t = tx([0xBBu8; 20], relay_calldata(&bad_salt, &nonce));
         assert_eq!(
-            classify(&cfg(), &t).unwrap_err(),
+            classify(&cfg(), &t, &hot()).unwrap_err(),
             PolicyError::AuthNonceMismatch
         );
     }
@@ -542,7 +570,7 @@ mod tests {
         data.extend_from_slice(&addr_word([0x66u8; 20]));
         data.extend_from_slice(&u256_word(2_500_000));
         let t = tx([0x44u8; 20], data);
-        let c = classify(&cfg(), &t).unwrap();
+        let c = classify(&cfg(), &t, &hot()).unwrap();
         assert_eq!(c.policy, Policy::Payout);
         assert_eq!(c.from, cfg().payout_hot_wallet);
         match c.outcome {
@@ -562,7 +590,7 @@ mod tests {
         data.extend_from_slice(&u256_word(1));
         let t = tx([0xFEu8; 20], data); // non-whitelisted token contract
         assert_eq!(
-            classify(&cfg(), &t).unwrap_err(),
+            classify(&cfg(), &t, &hot()).unwrap_err(),
             PolicyError::UnknownPolicy
         );
     }
@@ -570,7 +598,7 @@ mod tests {
     #[test]
     fn gap_filler_self_transfer() {
         let t = tx([0x22u8; 20], vec![]);
-        let c = classify(&cfg(), &t).unwrap();
+        let c = classify(&cfg(), &t, &hot()).unwrap();
         assert_eq!(c.policy, Policy::GapFiller);
         assert_eq!(c.from, cfg().payout_hot_wallet);
     }
@@ -579,14 +607,14 @@ mod tests {
     fn gap_filler_rejects_non_21000_gas() {
         let mut t = tx([0x11u8; 20], vec![]);
         t.gas_limit = 50_000;
-        assert!(matches!(classify(&cfg(), &t), Err(PolicyError::Violation(_))));
+        assert!(matches!(classify(&cfg(), &t, &hot()), Err(PolicyError::Violation(_))));
     }
 
     #[test]
     fn random_eoa_unknown_policy() {
         let t = tx([0x77u8; 20], vec![]);
         assert_eq!(
-            classify(&cfg(), &t).unwrap_err(),
+            classify(&cfg(), &t, &hot()).unwrap_err(),
             PolicyError::UnknownPolicy
         );
     }

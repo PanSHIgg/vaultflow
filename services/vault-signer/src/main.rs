@@ -3,6 +3,7 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use vault_signer::{config, db, engine::SignerCore, grpc, kms::LocalFileKms};
@@ -18,10 +19,10 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(path = %cfg_path, "config loaded");
 
     let signer_db = db::open(Path::new(&cfg.db_path))?;
-    let kms = LocalFileKms::from_kek_file(Path::new(&cfg.kek_file))?;
+    let kms = Arc::new(LocalFileKms::from_kek_file(Path::new(&cfg.kek_file))?);
     let chains = cfg.chain_policies()?;
     let admin_pubkey = cfg.admin_pubkey()?;
-    let core = SignerCore::new(signer_db, &kms, chains, admin_pubkey)?;
+    let core = SignerCore::new(signer_db, kms, chains, admin_pubkey)?;
     tracing::info!(wallets = ?core.loaded_wallets(), "hot wallet DEKs ready");
 
     let tls = grpc::mtls::ReloadingTls::load(cfg.cert_paths())?;

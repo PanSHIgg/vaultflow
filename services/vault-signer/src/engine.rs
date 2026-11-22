@@ -13,14 +13,16 @@
 //! a transaction is expressed as free functions taking only the disjoint
 //! fields they need (`chains`, `keys`, `admin_pubkey`) — never `&self`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use alloy_primitives::{Address, B256, U256};
 use ed25519_dalek::VerifyingKey;
 use prost::Message;
+use rand::rngs::OsRng;
 use rusqlite::{Connection, Transaction};
-use secrecy::ExposeSecret;
+use secrecy::{ExposeSecret, SecretVec};
 
 use crate::audit::{self, actions, decisions};
 use crate::crypto::{self, DecodedUnsignedTx};
@@ -79,12 +81,49 @@ pub struct HealthInfo {
     pub loaded_wallets: Vec<String>,
 }
 
+/// Outcome of a GenerateWallet request.
+#[derive(Debug)]
+pub struct WalletGenOutcome {
+    pub accepted: bool,
+    /// proto RejectCode numeric value (`0` on accept).
+    pub reject_code: i32,
+    pub reason: String,
+    pub audit_seq: u64,
+    /// `0x`-prefixed lowercase EVM address — populated only when accepted.
+    pub address: String,
+}
+
+/// One row of the `ListWallets` projection (metadata only — never key material).
+#[derive(Debug)]
+pub struct HotWalletMeta {
+    pub address: String,
+    pub label: String,
+    pub created_at_unix: i64,
+    pub loaded: bool,
+}
+
+/// Outcome of an UpdateColdWallets request.
+#[derive(Debug)]
+pub struct ColdUpdateOutcome {
+    pub accepted: bool,
+    /// proto RejectCode numeric value (`0` on accept).
+    pub reject_code: i32,
+    pub reason: String,
+    pub audit_seq: u64,
+    /// Effective allowlist for the chain after the call (`0x` lowercase,
+    /// ascending). Populated even on rejection with the pre-call list.
+    pub active_cold_wallets: Vec<String>,
+}
+
 /// The whole signer decision engine. Held behind a single Mutex in the gRPC
 /// layer; every public method is synchronous.
 pub struct SignerCore {
     db: SignerDb,
     chains: BTreeMap<u64, ChainPolicyConfig>,
     admin_pubkey: VerifyingKey,
+    /// KEK custody seam — retained so runtime provisioning (GenerateWallet)
+    /// can envelope-encrypt freshly generated DEKs without restart.
+    kms: Arc<dyn KmsProvider>,
     /// Loaded hot-wallet DEKs: address -> mlock'd, zeroize-on-drop secret.
     keys: BTreeMap<Address, LockedSecret>,
     started: Instant,
@@ -126,9 +165,12 @@ impl SignerCore {
     /// Decrypt every `encrypted_keys` envelope and verify each DEK really
     /// derives the recorded wallet address — a tampered envelope or wrong KEK
     /// is a hard boot failure, never a silent skip (zero-trust integrity).
+    /// The same check covers GenerateWallet-provisioned rows: they are
+    /// envelope-encrypted with the identical KMS path and satisfy it by
+    /// construction.
     pub fn new(
-        db: SignerDb,
-        kms: &dyn KmsProvider,
+        mut db: SignerDb,
+        kms: Arc<dyn KmsProvider>,
         chains: Vec<ChainPolicyConfig>,
         admin_pubkey: [u8; 32],
     ) -> anyhow::Result<Self> {
@@ -151,6 +193,18 @@ impl SignerCore {
             keys.insert(addr, LockedSecret::new(dek));
             tracing::info!(wallet = %row.wallet_address, label = %row.label, "hot wallet DEK loaded");
         }
+        // cold_wallets boot seeding — atomic so a mid-seed crash can't leave a
+        // partial allowlist that would suppress re-seeding on the next boot:
+        // config is the bootstrap source iff the table has NO rows for the
+        // chain; once any row exists the DB is authoritative (owned by
+        // UpdateColdWallets) and config is never consulted again.
+        {
+            let tx = db.conn.transaction()?;
+            for c in &chains {
+                db::seed_cold_wallets(&tx, c.chain_id, &c.allowed_cold_wallets, now_unix())?;
+            }
+            tx.commit()?;
+        }
         let chains = chains.into_iter().map(|c| (c.chain_id, c)).collect();
         let admin_pubkey = VerifyingKey::from_bytes(&admin_pubkey)
             .map_err(|e| anyhow::anyhow!("invalid admin_approver_pubkey: {e}"))?;
@@ -158,6 +212,7 @@ impl SignerCore {
             db,
             chains,
             admin_pubkey,
+            kms,
             keys,
             started: Instant::now(),
         })
@@ -210,6 +265,301 @@ impl SignerCore {
             now,
             |tx| revoke_inner(chains, tx, req, now),
         )
+    }
+
+    // ------------------------------------------------------------------
+    // GenerateWallet
+    // ------------------------------------------------------------------
+
+    /// Provision a new RELAYER/PAYOUT hot wallet at runtime: a fresh
+    /// secp256k1 secret is generated in-process, envelope-encrypted under the
+    /// KEK (same KMS path as provisioning tooling), persisted to
+    /// `encrypted_keys` — and, on commit, loaded into the in-memory key map so
+    /// it can sign WITHOUT restart. Only the derived address is ever returned.
+    pub fn generate_wallet(
+        &mut self,
+        req: &signer_v1::GenerateWalletRequest,
+    ) -> WalletGenOutcome {
+        let digest = audit::request_digest(&req.encode_to_vec());
+        let now = now_unix();
+
+        if req.role != "RELAYER" && req.role != "PAYOUT" {
+            return self.gen_reject(
+                digest,
+                now,
+                rej_msg(
+                    PolicyError::Violation("role must be RELAYER or PAYOUT"),
+                    format!("got {:?}", req.role),
+                ),
+            );
+        }
+        if !self.chains.contains_key(&req.chain_id) {
+            return self.gen_reject(
+                digest,
+                now,
+                rej_msg(
+                    PolicyError::Violation("unconfigured chain_id"),
+                    format!("chain_id {} not in signer config", req.chain_id),
+                ),
+            );
+        }
+
+        // Fresh secret inside secrecy types end-to-end; only the derived
+        // address leaves this function.
+        let dek = SecretVec::new(k256::SecretKey::random(&mut OsRng).to_bytes().to_vec());
+        let addr = match crypto::address_from_dek(dek.expose_secret()) {
+            Ok(a) => a,
+            Err(e) => {
+                return self.gen_reject(
+                    digest,
+                    now,
+                    rej_msg(PolicyError::Internal, format!("derive address: {e}")),
+                )
+            }
+        };
+        let envelope = match self.kms.encrypt_dek(dek.expose_secret()) {
+            Ok(e) => e,
+            Err(e) => {
+                return self.gen_reject(
+                    digest,
+                    now,
+                    rej_msg(PolicyError::Internal, format!("envelope encrypt: {e}")),
+                )
+            }
+        };
+        let addr_hex = fmt_addr(&addr);
+        let label = format!("role:{}:chain:{}", req.role, req.chain_id);
+
+        // State change + audit append in ONE transaction (same discipline as
+        // register/revoke): a failed commit leaves neither the row nor the
+        // audit entry — and no in-memory key either (insert below is
+        // accept-gated).
+        let ack = run_audited(
+            &mut self.db.conn,
+            actions::GENERATE_WALLET,
+            digest,
+            now,
+            |tx| {
+                db::upsert_encrypted_key(tx, &addr_hex, &label, &envelope, now)
+                    .map_err(|e| rej_msg(PolicyError::Internal, e.to_string()))?;
+                Ok(format!(
+                    "generated role={} chain_id={} address={addr_hex}",
+                    req.role, req.chain_id
+                ))
+            },
+        );
+
+        if ack.accepted {
+            // LIVE pickup: join the in-memory key map immediately. The wallet
+            // is GAP_FILLER-eligible at once (its self-transfers classify via
+            // the hot-wallet set); SWEEP/RELAY `from` stays bound to
+            // cfg.relayer_hot_wallet and PAYOUT to cfg.payout_hot_wallet
+            // until an operator cutover, matching the frozen `from`-forcing
+            // contract in policy::classify.
+            self.keys.insert(addr, LockedSecret::new(dek));
+            tracing::info!(wallet = %addr_hex, label = %label, "runtime-provisioned hot wallet DEK loaded");
+        }
+        WalletGenOutcome {
+            accepted: ack.accepted,
+            reject_code: ack.reject_code,
+            reason: ack.reason,
+            audit_seq: ack.audit_seq,
+            address: if ack.accepted { addr_hex } else { String::new() },
+        }
+    }
+
+    fn gen_reject(
+        &mut self,
+        digest: [u8; 32],
+        now: i64,
+        (code, reason): Rejection,
+    ) -> WalletGenOutcome {
+        let seq = self.audit_append(
+            actions::GENERATE_WALLET,
+            digest,
+            now,
+            decisions::REJECTED,
+            &reason,
+        );
+        WalletGenOutcome {
+            accepted: false,
+            reject_code: code,
+            reason,
+            audit_seq: seq,
+            address: String::new(),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // UpdateColdWallets
+    // ------------------------------------------------------------------
+
+    /// Runtime COLD allowlist mutation for a chain — idempotent add/remove,
+    /// persisted to `cold_wallets`, audited, and effective on the very next
+    /// SWEEP sign request (the DB is the sole authority after boot seeding).
+    pub fn update_cold_wallets(
+        &mut self,
+        req: &signer_v1::UpdateColdWalletsRequest,
+    ) -> ColdUpdateOutcome {
+        let digest = audit::request_digest(&req.encode_to_vec());
+        let now = now_unix();
+
+        if !self.chains.contains_key(&req.chain_id) {
+            return self.cold_reject(
+                req.chain_id,
+                digest,
+                now,
+                rej_msg(
+                    PolicyError::Violation("unconfigured chain_id"),
+                    format!("chain_id {} not in signer config", req.chain_id),
+                ),
+            );
+        }
+
+        // Every address must be exactly 20B; dedupe within each list.
+        let mut add_set = BTreeSet::<[u8; 20]>::new();
+        let mut rm_set = BTreeSet::<[u8; 20]>::new();
+        let mut bad_len: Option<(&'static str, usize)> = None;
+        for raw in &req.add {
+            match <[u8; 20]>::try_from(raw.as_slice()) {
+                Ok(a) => {
+                    add_set.insert(a);
+                }
+                Err(_) => {
+                    bad_len = Some(("add", raw.len()));
+                    break;
+                }
+            }
+        }
+        if bad_len.is_none() {
+            for raw in &req.remove {
+                match <[u8; 20]>::try_from(raw.as_slice()) {
+                    Ok(a) => {
+                        rm_set.insert(a);
+                    }
+                    Err(_) => {
+                        bad_len = Some(("remove", raw.len()));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some((which, len)) = bad_len {
+            return self.cold_reject(
+                req.chain_id,
+                digest,
+                now,
+                rej_msg(
+                    PolicyError::Violation("cold wallet address must be exactly 20B"),
+                    format!("{which} entry is {len}B"),
+                ),
+            );
+        }
+        // An address present in BOTH lists is ambiguous operator input —
+        // for a security whitelist, reject rather than guess a precedence.
+        if let Some(a) = add_set.intersection(&rm_set).next() {
+            return self.cold_reject(
+                req.chain_id,
+                digest,
+                now,
+                rej_msg(
+                    PolicyError::Violation("address present in both add and remove"),
+                    fmt_addr(&Address::from(*a)),
+                ),
+            );
+        }
+
+        let mut active: Vec<String> = Vec::new();
+        let (n_add, n_rm) = (add_set.len(), rm_set.len());
+        let ack = run_audited(
+            &mut self.db.conn,
+            actions::UPDATE_COLD_WALLETS,
+            digest,
+            now,
+            |tx| {
+                for a in &add_set {
+                    db::cold_wallet_add(tx, req.chain_id, &Address::from(*a), now)
+                        .map_err(|e| rej_msg(PolicyError::Internal, e.to_string()))?;
+                }
+                for a in &rm_set {
+                    db::cold_wallet_remove(tx, req.chain_id, &Address::from(*a))
+                        .map_err(|e| rej_msg(PolicyError::Internal, e.to_string()))?;
+                }
+                let list = db::cold_wallets_list(tx, req.chain_id)
+                    .map_err(|e| rej_msg(PolicyError::Internal, e.to_string()))?;
+                active = list.iter().map(fmt_addr).collect();
+                Ok(format!(
+                    "chain_id={} add={n_add} remove={n_rm} active={}",
+                    req.chain_id,
+                    active.len()
+                ))
+            },
+        );
+        ColdUpdateOutcome {
+            accepted: ack.accepted,
+            reject_code: ack.reject_code,
+            reason: ack.reason,
+            audit_seq: ack.audit_seq,
+            active_cold_wallets: active,
+        }
+    }
+
+    /// Audited rejection for UpdateColdWallets; the response still carries the
+    /// current effective allowlist so callers can reconcile state.
+    fn cold_reject(
+        &mut self,
+        chain_id: u64,
+        digest: [u8; 32],
+        now: i64,
+        (code, reason): Rejection,
+    ) -> ColdUpdateOutcome {
+        let seq = self.audit_append(
+            actions::UPDATE_COLD_WALLETS,
+            digest,
+            now,
+            decisions::REJECTED,
+            &reason,
+        );
+        let active = db::cold_wallets_list(&self.db.conn, chain_id)
+            .map(|v| v.iter().map(fmt_addr).collect())
+            .unwrap_or_default();
+        ColdUpdateOutcome {
+            accepted: false,
+            reject_code: code,
+            reason,
+            audit_seq: seq,
+            active_cold_wallets: active,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // ListWallets / ListColdWallets — signer-cli 运维只读面
+    // ------------------------------------------------------------------
+
+    /// 热钱包元数据清单 — 只读查询, 不落审计链 (与 health() 同级).
+    /// `loaded` 标记 DEK 当前在内存 map 中 — 可用于签名.
+    pub fn list_wallets(&self) -> anyhow::Result<Vec<HotWalletMeta>> {
+        let rows = db::list_wallet_key_meta(&self.db.conn)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| HotWalletMeta {
+                loaded: parse_addr(&r.wallet_address)
+                    .map(|a| self.keys.contains_key(&a))
+                    .unwrap_or(false),
+                address: r.wallet_address,
+                label: r.label,
+                created_at_unix: r.created_at,
+            })
+            .collect())
+    }
+
+    /// 指定链当前生效冷钱包白名单 — 只读, DB 权威 (含运行期增删).
+    pub fn list_cold_wallets(&self, chain_id: u64) -> anyhow::Result<Vec<String>> {
+        if !self.chains.contains_key(&chain_id) {
+            anyhow::bail!("chain_id {chain_id} not in signer config");
+        }
+        let list = db::cold_wallets_list(&self.db.conn, chain_id)?;
+        Ok(list.iter().map(fmt_addr).collect())
     }
 
     // ------------------------------------------------------------------
@@ -603,7 +953,15 @@ fn sign_inner(
         ));
     }
 
-    let c = policy::classify(cfg, decoded).map_err(rej)?;
+    // GAP_FILLER eligibility = every DEK loaded in memory (including
+    // runtime-provisioned GenerateWallet keys — live without restart) ∪ the
+    // configured pair, so a configured-but-unloaded wallet still classifies
+    // and fails cleanly at the "no loaded DEK" check below.
+    let mut hot_wallets: BTreeSet<Address> = keys.keys().copied().collect();
+    hot_wallets.insert(cfg.relayer_hot_wallet);
+    hot_wallets.insert(cfg.payout_hot_wallet);
+
+    let c = policy::classify(cfg, decoded, &hot_wallets).map_err(rej)?;
 
     // policy_hint is advisory-only but must agree with our own conclusion.
     if req.policy_hint != 0 && req.policy_hint != c.policy.proto_code() {
@@ -611,6 +969,21 @@ fn sign_inner(
             PolicyError::Violation("policy_hint mismatch"),
             format!("hint={} derived={}", req.policy_hint, c.policy.proto_code()),
         ));
+    }
+
+    // SWEEP cold-wallet membership — checked HERE (not in policy::classify)
+    // against the DB-authoritative `cold_wallets` table inside this very
+    // transaction, so UpdateColdWallets takes effect on the next sign call
+    // and the check can never observe a half-applied update.
+    if let PolicyOutcome::Sweep {
+        target_cold_wallet, ..
+    } = &c.outcome
+    {
+        let allowed = db::cold_wallet_allowed(tx, cfg.chain_id, target_cold_wallet)
+            .map_err(|e| rej_msg(PolicyError::Internal, e.to_string()))?;
+        if !allowed {
+            return Err(rej(PolicyError::ColdWalletNotAllowed));
+        }
     }
 
     let auth_note: String = match &c.outcome {

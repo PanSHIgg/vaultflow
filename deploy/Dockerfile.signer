@@ -3,6 +3,7 @@ FROM ubuntu:24.04
 RUN useradd -r -u 10001 -m vaultsigner
 WORKDIR /var/lib/vault-signer
 COPY vault-signer /usr/local/bin/vault-signer
+COPY signer-cli /usr/local/bin/signer-cli
 ENV VAULT_SIGNER_CONFIG=/etc/vaultflow/signer-config.json
 EXPOSE 50051
 USER vaultsigner

@@ -1,11 +1,7 @@
 package api
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -16,7 +12,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	"vaultflow/gateway-core/internal/types"
+	"vaultflow/gateway-core/internal/auth"
 )
 
 // ctxKey 请求上下文私有键.
@@ -24,7 +20,7 @@ type ctxKey int
 
 const (
 	ctxKeyRequestID ctxKey = iota
-	ctxKeyMerchant
+	ctxKeyUser
 	ctxKeyAdminSub
 	ctxKeyBody
 )
@@ -37,10 +33,10 @@ func RequestIDFrom(ctx context.Context) string {
 	return ""
 }
 
-// MerchantFromCtx 取已鉴权商户 (merchantAuth 之后可用).
-func MerchantFromCtx(r *http.Request) (types.Merchant, bool) {
-	m, ok := r.Context().Value(ctxKeyMerchant).(types.Merchant)
-	return m, ok
+// UserIDFromCtx 取已鉴权终端用户 id (userAuth 之后可用).
+func UserIDFromCtx(r *http.Request) (uuid.UUID, bool) {
+	id, ok := r.Context().Value(ctxKeyUser).(uuid.UUID)
+	return id, ok
 }
 
 // AdminSubFromCtx 取已鉴权管理端 JWT sub.
@@ -97,44 +93,48 @@ func (s *Server) recoverer(next http.Handler) http.Handler {
 // 鉴权
 // ---------------------------------------------------------------------------
 
-// merchantAuth X-Api-Key -> SHA-256 hex -> Store.ResolveAPIKey -> ctx merchant.
-// 密钥本体不落库不落日志, 仅哈希匹配 (merchants.api_key_hash).
-func (s *Server) merchantAuth(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := strings.TrimSpace(r.Header.Get("X-Api-Key"))
-		if key == "" {
-			writeError(w, r, unauthorized("missing X-Api-Key header"))
-			return
-		}
-		if len(key) > 256 {
-			writeError(w, r, unauthorized("invalid API key"))
-			return
-		}
-		sum := sha256.Sum256([]byte(key))
-		if s.deps.Store == nil {
-			writeError(w, r, upstream("merchant directory unavailable"))
-			return
-		}
-		m, err := s.deps.Store.ResolveAPIKey(r.Context(), hex.EncodeToString(sum[:]))
-		if err != nil {
-			writeError(w, r, unauthorized("invalid API key"))
-			return
-		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKeyMerchant, m)))
-	})
+// bearerToken 提取 Authorization: Bearer <token> (首尾空白容错).
+func bearerToken(r *http.Request) (string, bool) {
+	hdr := strings.TrimSpace(r.Header.Get("Authorization"))
+	if !strings.HasPrefix(hdr, "Bearer ") {
+		return "", false
+	}
+	raw := strings.TrimSpace(strings.TrimPrefix(hdr, "Bearer "))
+	return raw, raw != ""
 }
 
-// adminAuth Bearer JWT (HS256, sub 必填) -> ctx admin subject.
-func (s *Server) adminAuth(next http.Handler) http.Handler {
+// userAuth Bearer JWT (HS256, role="user", sub=user_uuid) -> ctx user_id.
+// 校验逻辑收敛在 internal/auth.ParseUserToken (与 IssueUserToken 成对).
+func (s *Server) userAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		hdr := strings.TrimSpace(r.Header.Get("Authorization"))
-		if !strings.HasPrefix(hdr, "Bearer ") {
+		raw, ok := bearerToken(r)
+		if !ok {
 			writeError(w, r, unauthorized("missing bearer token"))
 			return
 		}
-		raw := strings.TrimSpace(strings.TrimPrefix(hdr, "Bearer "))
+		if len(s.deps.UserJWTKey) == 0 {
+			writeError(w, r, internalErr("user auth not configured"))
+			return
+		}
+		uid, err := auth.ParseUserToken(s.deps.UserJWTKey, raw)
+		if err != nil {
+			writeError(w, r, unauthorized("invalid bearer token"))
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKeyUser, uid)))
+	})
+}
+
+// adminAuth Bearer JWT (HS256, sub 必填, ADMIN_JWT_SECRET 独立密钥) -> ctx admin subject.
+func (s *Server) adminAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, ok := bearerToken(r)
+		if !ok {
+			writeError(w, r, unauthorized("missing bearer token"))
+			return
+		}
 		if len(s.deps.AdminJWTKey) == 0 {
-			writeError(w, r, upstream("admin auth not configured"))
+			writeError(w, r, internalErr("admin auth not configured"))
 			return
 		}
 		tok, err := jwt.Parse(raw, func(t *jwt.Token) (any, error) {
@@ -159,140 +159,10 @@ func (s *Server) adminAuth(next http.Handler) http.Handler {
 }
 
 // ---------------------------------------------------------------------------
-// 幂等中间件 (openapi: 每个非 GET 端点强制 Idempotency-Key)
+// 频控中间件 (per-IP / per-subject 固定窗口桶)
 // ---------------------------------------------------------------------------
 
-// idempotency 写接口幂等: 同 (scope,key) 同 body SHA-256 回放首响应,
-// 异 body -> 409 IDEMPOTENCY_CONFLICT. scope 取已鉴权主体
-// (merchant:<id> / admin:<sub> / public:<orderId>).
-func (s *Server) idempotency(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
-		if key == "" {
-			writeError(w, r, apiErr(http.StatusBadRequest, CodeIdempotencyKeyRequired,
-				"Idempotency-Key header is required on non-GET endpoints"))
-			return
-		}
-		if !idemKeyPattern.MatchString(key) {
-			writeError(w, r, badRequest("invalid Idempotency-Key format"))
-			return
-		}
-		body, err := readBody(r, s.deps.Config.MaxBodyBytes)
-		if err != nil {
-			writeError(w, r, badRequest(err.Error()))
-			return
-		}
-		r.Body = io.NopCloser(bytes.NewReader(body))
-		r = r.WithContext(context.WithValue(r.Context(), ctxKeyBody, body))
-		hash := bodySHA256Hex(body)
-		scope := s.idemScope(r)
-		store := s.deps.IdemStore
-		if store == nil {
-			// 防御: NewServer 已保证非 nil; 直接构造 Server{} 的调用兜底.
-			writeError(w, r, upstream("idempotency store unavailable"))
-			return
-		}
-
-		replay := func(rec IdempotencyRecord) {
-			w.Header().Set("X-Idempotent-Replay", "true")
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(rec.StatusCode)
-			_, _ = w.Write(rec.Body)
-		}
-
-		if rec, found, lerr := store.Load(r.Context(), scope, key); lerr == nil && found {
-			if rec.RequestHash != hash {
-				writeError(w, r, conflict(CodeIdempotencyConflict,
-					"Idempotency-Key was already used with a different request body"))
-				return
-			}
-			replay(rec)
-			return
-		}
-
-		// 同实例同键串行化: 并发重复请求等待首个完成后回放.
-		lk := s.idemLocks.lockFor(scope, key)
-		lk.Lock()
-		defer lk.Unlock()
-		if rec, found, lerr := store.Load(r.Context(), scope, key); lerr == nil && found {
-			if rec.RequestHash != hash {
-				writeError(w, r, conflict(CodeIdempotencyConflict,
-					"Idempotency-Key was already used with a different request body"))
-				return
-			}
-			replay(rec)
-			return
-		}
-
-		cw := &captureWriter{ResponseWriter: w, status: http.StatusOK}
-		next.ServeHTTP(cw, r)
-
-		// 仅缓存确定性响应: 2xx/4xx (5xx 与 429 不缓存, 便于重试恢复).
-		if cw.status < 500 && cw.status != http.StatusTooManyRequests {
-			rec := IdempotencyRecord{
-				RequestHash: hash, StatusCode: cw.status,
-				Body: cw.buf.Bytes(), StoredAt: s.deps.now().Unix(),
-			}
-			stored, serr := store.SaveNX(r.Context(), scope, key, rec, s.deps.Config.IdempotencyTTL)
-			if serr == nil && !stored {
-				// 跨实例并发: 已有首响应存档 — 以存档为准回放.
-				if rec2, found2, lerr2 := store.Load(r.Context(), scope, key); lerr2 == nil && found2 && rec2.RequestHash == hash {
-					replay(rec2)
-					return
-				}
-			}
-		}
-		cw.flushTo(w)
-	})
-}
-
-// idemScope 幂等作用域 = 已鉴权主体 (openapi IdempotencyKey 定义).
-func (s *Server) idemScope(r *http.Request) string {
-	if m, ok := MerchantFromCtx(r); ok {
-		return "merchant:" + m.ID.String()
-	}
-	if sub := AdminSubFromCtx(r); sub != "" {
-		return "admin:" + sub
-	}
-	if oid := r.PathValue("orderId"); oid != "" {
-		return "public:" + oid
-	}
-	return "anonymous"
-}
-
-// captureWriter 捕获状态码与响应体 (幂等存档后延迟写出).
-type captureWriter struct {
-	http.ResponseWriter
-	status     int
-	buf        bytes.Buffer
-	headerSunk bool
-}
-
-func (c *captureWriter) WriteHeader(code int) {
-	if c.headerSunk {
-		return
-	}
-	c.headerSunk = true
-	c.status = code
-}
-
-func (c *captureWriter) Write(b []byte) (int, error) {
-	return c.buf.Write(b)
-}
-
-// Flush implements http.Flusher — SSE handler 等流式响应即时透传且不参与存档.
-func (c *captureWriter) Flush() {}
-
-func (c *captureWriter) flushTo(w http.ResponseWriter) {
-	w.WriteHeader(c.status)
-	_, _ = w.Write(c.buf.Bytes())
-}
-
-// ---------------------------------------------------------------------------
-// 频控中间件 (三种作用域桶)
-// ---------------------------------------------------------------------------
-
-// rateLimit 以 keyFn 派生桶键执行固定窗口限流; 超限 -> 429 + Retry-After.
+// rateLimit 以 keyFn 派生桶键执行固定窗口限流; 超限 -> 429 RATE_LIMITED + Retry-After.
 func (s *Server) rateLimit(rule RateLimitRule, keyFn func(*http.Request) string) middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

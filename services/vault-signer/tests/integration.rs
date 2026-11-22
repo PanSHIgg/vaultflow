@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, B256, U256};
 use ed25519_dalek::{Signer, SigningKey};
+use secrecy::ExposeSecret;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tonic::Request;
 
@@ -21,7 +22,7 @@ use vault_signer::grpc::service::VaultSignerSvc;
 use vault_signer::grpc::signer_v1::vault_signer_service_client::VaultSignerServiceClient;
 use vault_signer::grpc::signer_v1::vault_signer_service_server::VaultSignerService;
 use vault_signer::grpc::signer_v1::*;
-use vault_signer::kms::LocalFileKms;
+use vault_signer::kms::{KmsProvider, LocalFileKms};
 use vault_signer::policy::ChainPolicyConfig;
 
 // ---------------------------------------------------------------------------
@@ -246,7 +247,7 @@ fn fixture(cooldown_secs: u64, daily_limit: Option<U256>) -> Fx {
         daily_payout_limit_atomic: daily_limit,
     };
     let admin_pubkey: [u8; 32] = unhex(ADMIN_PUB_HEX).try_into().unwrap();
-    let core = SignerCore::new(db, &kms, vec![cfg.clone()], admin_pubkey).unwrap();
+    let core = SignerCore::new(db, Arc::new(kms), vec![cfg.clone()], admin_pubkey).unwrap();
     Fx {
         svc: VaultSignerSvc::new(core),
         cfg,
@@ -1068,4 +1069,214 @@ async fn revoked_lease_replay_rejected_fresh_sig_resurrects() {
     let payload_c = addr_v1_payload(CHAIN, &MERCHANT_GOLDEN, &recip, now + 50 * 86_400);
     let resp = register(svc, payload_c.clone(), ed_sign(&fx.admin_sk, &payload_c)).await;
     assert!(resp.accepted, "fresh approval must resurrect after every revoke: {}", resp.reason);
+}
+
+// ---------------------------------------------------------------------------
+// 11. UpdateColdWallets: dynamic COLD allowlist — runtime add/remove takes
+//     effect on the very next SWEEP sign call; idempotent; validated.
+// ---------------------------------------------------------------------------
+
+async fn update_cold(svc: &VaultSignerSvc, chain: u64, add: Vec<Vec<u8>>, remove: Vec<Vec<u8>>) -> UpdateColdWalletsResponse {
+    svc.update_cold_wallets(Request::new(UpdateColdWalletsRequest {
+        chain_id: chain,
+        add: add.into_iter().map(Into::into).collect(),
+        remove: remove.into_iter().map(Into::into).collect(),
+    }))
+    .await
+    .unwrap()
+    .into_inner()
+}
+
+#[tokio::test]
+async fn update_cold_wallets_runtime_rotation() {
+    let fx = fixture(0, None);
+    let svc = &fx.svc;
+    let cold = Address::from([0xCCu8; 20]);   // seeded from config
+    let cold2 = Address::from([0xCDu8; 20]);  // seeded from config
+    let new_cold = Address::from([0xDDu8; 20]);
+
+    // Boot seeding: config allowlist lands in the DB.
+    let r = update_cold(svc, CHAIN, vec![], vec![]).await;
+    assert!(r.accepted, "{}", r.reason);
+    assert_eq!(
+        r.active_cold_wallets,
+        vec![fmt_addr(&cold), fmt_addr(&cold2)]
+    );
+
+    // Rotation window: add new wallet, keep both (dual-track).
+    let r = update_cold(
+        svc,
+        CHAIN,
+        vec![new_cold.as_slice().to_vec()],
+        vec![],
+    )
+    .await;
+    assert!(r.accepted, "{}", r.reason);
+    assert_eq!(
+        r.active_cold_wallets,
+        vec![fmt_addr(&cold), fmt_addr(&cold2), fmt_addr(&new_cold)]
+    );
+
+    // SWEEP to the NEW cold wallet now signs (live effect, no restart).
+    let data = sweep_calldata(*fx.token.0, *new_cold.0, &[[0x77u8; 32]]);
+    let tx = unsigned_tx(CHAIN, 0, fx.cfg.batch_sweeper, data, 1, 2, 200_000);
+    expect_signed(&sign(svc, sign_req(tx, 1, None, 0)).await);
+
+    // Cutover complete: remove BOTH old wallets.
+    let r = update_cold(
+        svc,
+        CHAIN,
+        vec![],
+        vec![cold.as_slice().to_vec(), cold2.as_slice().to_vec()],
+    )
+    .await;
+    assert!(r.accepted, "{}", r.reason);
+    assert_eq!(r.active_cold_wallets, vec![fmt_addr(&new_cold)]);
+
+    // SWEEP to the removed cold wallet is now COLD_WALLET_NOT_ALLOWED.
+    let data = sweep_calldata(*fx.token.0, *cold.0, &[[0x77u8; 32]]);
+    let tx = unsigned_tx(CHAIN, 1, fx.cfg.batch_sweeper, data, 1, 2, 200_000);
+    let r = sign(svc, sign_req(tx, 1, None, 0)).await;
+    expect_reject(&r, RejectCode::ColdWalletNotAllowed);
+
+    // Idempotent replay of the last update — same effective list.
+    let r = update_cold(
+        svc,
+        CHAIN,
+        vec![],
+        vec![cold.as_slice().to_vec(), cold2.as_slice().to_vec()],
+    )
+    .await;
+    assert!(r.accepted, "{}", r.reason);
+    assert_eq!(r.active_cold_wallets, vec![fmt_addr(&new_cold)]);
+}
+
+#[tokio::test]
+async fn update_cold_wallets_rejects_bad_input() {
+    let fx = fixture(0, None);
+    let svc = &fx.svc;
+    let cold = Address::from([0xCCu8; 20]);
+
+    // (a) malformed address length -> POLICY_VIOLATION (audited reject).
+    let r = update_cold(svc, CHAIN, vec![vec![0xAAu8; 19]], vec![]).await;
+    assert!(!r.accepted);
+    assert_eq!(r.reject_code, RejectCode::PolicyViolation as i32);
+    assert!(r.audit_seq > 0, "rejected update must land on audit chain");
+
+    // (b) same address in add AND remove -> ambiguous, rejected.
+    let r = update_cold(
+        svc,
+        CHAIN,
+        vec![cold.as_slice().to_vec()],
+        vec![cold.as_slice().to_vec()],
+    )
+    .await;
+    assert!(!r.accepted);
+    assert_eq!(r.reject_code, RejectCode::PolicyViolation as i32);
+
+    // (c) unconfigured chain_id -> rejected; response still carries the
+    //     (empty) effective list for that chain.
+    let r = update_cold(svc, 999, vec![], vec![]).await;
+    assert!(!r.accepted);
+    assert_eq!(r.reject_code, RejectCode::PolicyViolation as i32);
+    assert!(r.active_cold_wallets.is_empty());
+
+    // The seeded list survived all rejections untouched.
+    let r = update_cold(svc, CHAIN, vec![], vec![]).await;
+    assert_eq!(
+        r.active_cold_wallets,
+        vec![fmt_addr(&cold), fmt_addr(&Address::from([0xCDu8; 20]))]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 12. GenerateWallet: runtime RELAYER/PAYOUT provisioning — envelope lands in
+//     encrypted_keys satisfying the boot integrity check; the DEK joins the
+//     in-memory key map WITHOUT restart (GAP_FILLER signable at once); only
+//     the address is ever returned.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn generate_wallet_provisions_and_live_picks_up() {
+    let fx = fixture(0, None);
+    let svc = &fx.svc;
+
+    // (a) valid PAYOUT provisioning.
+    let resp = svc
+        .generate_wallet(Request::new(GenerateWalletRequest {
+            chain_id: CHAIN,
+            role: "PAYOUT".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp.audit_seq > 0);
+    assert!(resp.address.starts_with("0x") && resp.address.len() == 42);
+    let new_addr = Address::from_slice(&unhex(&resp.address));
+
+    // (b) RELAYER also accepted; bogus role / chain -> INVALID_ARGUMENT and
+    //     a REJECTED audit entry.
+    let resp2 = svc
+        .generate_wallet(Request::new(GenerateWalletRequest {
+            chain_id: CHAIN,
+            role: "RELAYER".to_string(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resp2.address.starts_with("0x") && resp2.address != resp.address);
+
+    let err = svc
+        .generate_wallet(Request::new(GenerateWalletRequest {
+            chain_id: CHAIN,
+            role: "COLD".to_string(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    let err = svc
+        .generate_wallet(Request::new(GenerateWalletRequest {
+            chain_id: 999,
+            role: "PAYOUT".to_string(),
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // (c) persisted envelope satisfies the boot integrity check: decrypting
+    //     it under the same KEK derives exactly the returned address, and the
+    //     label records role + chain.
+    {
+        let core = svc.core_handle();
+        let g = core.lock().unwrap();
+        let rows = db::load_encrypted_keys(&g.db().conn).unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.wallet_address == resp.address)
+            .expect("generated key must be persisted");
+        assert_eq!(row.label, format!("role:PAYOUT:chain:{CHAIN}"));
+        let kms2 = LocalFileKms::from_kek_bytes(&KEK);
+        let dek = kms2.decrypt_dek(&row.dek_envelope).unwrap();
+        assert_eq!(
+            crypto::address_from_dek(dek.expose_secret()).unwrap(),
+            new_addr,
+            "envelope must derive the returned address (boot integrity)"
+        );
+        // Live pickup: wallet already in the in-memory key map.
+        assert!(g.loaded_wallets().contains(&new_addr));
+    }
+
+    // (d) LIVE signing: a GAP_FILLER self-transfer of the brand-new wallet
+    //     signs WITHOUT restart and is recoverable back to it.
+    let tx = unsigned_tx(CHAIN, 0, new_addr, vec![], 1, 2, 21_000);
+    let s = expect_signed(&sign(svc, sign_req(tx, 4, None, 0)).await);
+    assert_eq!(crypto::recover_signer(&s.raw_tx).unwrap(), new_addr);
+
+    // (e) audit chain intact over register/sign/generate/update traffic.
+    let v = svc
+        .verify_audit_chain(Request::new(VerifyAuditChainRequest { from_seq: 0, to_seq: 0 }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(v.valid);
 }

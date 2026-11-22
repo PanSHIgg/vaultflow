@@ -52,6 +52,25 @@ service VaultSignerService {
   // 健康度与运行态巡检 (版本 / 时钟 / 白名单规模 / 审计链 tip)。
   rpc GetSignerHealth(GetSignerHealthRequest)
       returns (GetSignerHealthResponse);
+
+  // 生成新的热钱包密钥对 (RELAYER/PAYOUT)。signer 经 KMS 生成 secp256k1
+  // 私钥, AES-256-GCM 信封加密落 encrypted_keys, 仅返回派生地址。
+  // 私钥永不离开 signer 进程边界。role 仅接受 "RELAYER"/"PAYOUT"。
+  rpc GenerateWallet(GenerateWalletRequest) returns (GenerateWalletResponse);
+
+  // 动态更新指定链的冷钱包白名单 (COLD 增删)。幂等; 持久化到 signer
+  // 本地 SQLite cold_wallets 表, 立即影响后续 SWEEP 策略校验。
+  // 轮换窗口 = 新旧地址同时存在于白名单。
+  rpc UpdateColdWallets(UpdateColdWalletsRequest) returns (UpdateColdWalletsResponse);
+
+  // 热钱包清单 (signer-cli 运维面的"查") — 仅元数据: 地址 / 角色
+  // 标签 / 创建时间 / 密钥是否已装载可签名。永不返回私钥材料。
+  // 热钱包只增不删 — 密钥均为派生品, 无"改"语义, 故无 Remove RPC。
+  rpc ListWallets(ListWalletsRequest) returns (ListWalletsResponse);
+
+  // 查询指定链当前生效的冷钱包白名单 (DB 权威 — 含运行期增删后的
+  // 最新状态, 不受 boot-seed config 影响)。
+  rpc ListColdWallets(ListColdWalletsRequest) returns (ListColdWalletsResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -207,4 +226,63 @@ message GetSignerHealthResponse {
   uint64 audit_entries = 5;           // 审计日志总数
   bytes audit_tip_hash = 6;           // 当前哈希链 tip (32B)
   repeated string loaded_wallets = 7; // 已加载热钱包地址 (0x...)
+}
+
+// ---------------------------------------------------------------------------
+// GenerateWallet
+// ---------------------------------------------------------------------------
+
+message GenerateWalletRequest {
+  uint64 chain_id = 1;
+  string role = 2; // "RELAYER" | "PAYOUT"
+}
+
+message GenerateWalletResponse {
+  string address = 1;   // 0x 前缀小写 hex, 20B EVM 地址; 拒绝时为空并经 gRPC status 报错
+  uint64 audit_seq = 2;
+}
+
+// ---------------------------------------------------------------------------
+// UpdateColdWallets
+// ---------------------------------------------------------------------------
+
+message UpdateColdWalletsRequest {
+  uint64 chain_id = 1;
+  repeated bytes add = 2;    // 待放行地址 (20B 原始字节)
+  repeated bytes remove = 3; // 待移除地址 (20B 原始字节)
+}
+
+message UpdateColdWalletsResponse {
+  bool accepted = 1;
+  // 复用 RejectCode: db 错误 -> INTERNAL, 非法输入 -> POLICY_VIOLATION
+  RejectCode reject_code = 2;
+  string reason = 3;
+  uint64 audit_seq = 4;
+  // 更新后的生效冷钱包白名单 (0x 小写 hex)
+  repeated string active_cold_wallets = 5;
+}
+
+// ---------------------------------------------------------------------------
+// ListWallets / ListColdWallets — signer-cli 运维查询面
+// ---------------------------------------------------------------------------
+
+message ListWalletsRequest {}
+
+message HotWalletInfo {
+  string address = 1;         // 0x 前缀小写 hex
+  string label = 2;           // e.g. "role:RELAYER:chain:31337" / 部署期标签
+  int64 created_at_unix = 3;  // 密钥登记时间 (signer 本地时钟)
+  bool loaded = 4;            // DEK 已装载内存 — 当前可用于签名
+}
+
+message ListWalletsResponse {
+  repeated HotWalletInfo wallets = 1;
+}
+
+message ListColdWalletsRequest {
+  uint64 chain_id = 1;
+}
+
+message ListColdWalletsResponse {
+  repeated string active_cold_wallets = 1; // 0x 前缀小写 hex, 升序
 }

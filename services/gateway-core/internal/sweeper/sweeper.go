@@ -1,9 +1,12 @@
-// Package sweeper implements W4-4: 定额批量归集编排与热钱包水位监控.
+// Package sweeper implements 定额批量归集编排与热钱包水位监控 (交易所托管模型).
 //
-//   - 周期性聚合各白名单资产下"已 FINALIZED 且未隔离"的 vault 精确余额
-//     (Σ FINALIZED 入站 − 已 SWEPT − 在途 PENDING 占用), 组装 <=50 条目的
-//     sweep_batches + sweep_batch_items, 经 TxManager 广播
-//     BatchSweeper.deployAndSweepBatch;
+//   - 周期性聚合各白名单资产下"已 FINALIZED/CREDITED 且未隔离"的
+//     user_deposit_addresses vault 精确余额 (Σ 入站 − 已 SWEPT − 在途
+//     PENDING 占用), 组装 <=50 条目的 sweep_batches + sweep_batch_items,
+//     经 TxManager 广播 BatchSweeper.deployAndSweepBatch;
+//   - 冷金库目标每 sweep tick 动态取 store.GetActiveColdWallets 首个 ACTIVE
+//     — admin 平台钱包 CRUD 无重启生效; 无 ACTIVE 冷金库时 CRITICAL 告警
+//     并跳过本轮 (不误建批);
 //   - 批次级 VaultSwept/VaultQuarantined 事件解析与状态落库由 indexer
 //     两段式确认完成 — 本包只负责聚合建批与水位监控;
 //   - 水位监控: payout 热钱包各稳定币备付额 + 双热钱包原生 ETH,
@@ -25,6 +28,7 @@ import (
 
 	"vaultflow/gateway-core/internal/chain"
 	"vaultflow/gateway-core/internal/ports"
+	"vaultflow/gateway-core/internal/store"
 	"vaultflow/gateway-core/internal/types"
 )
 
@@ -55,6 +59,8 @@ type WaterQuerier interface {
 }
 
 // Config 归集编排参数.
+// 冷金库不再是静态字段 — 每 sweep tick 经 store.GetActiveColdWallets 动态
+// 解析 (platform_wallets admin CRUD 热生效).
 type Config struct {
 	ChainID        types.ChainID
 	PollInterval   time.Duration // 聚合 tick (默认 30s)
@@ -63,8 +69,8 @@ type Config struct {
 	BatchSweeper   types.Address // BatchSweeper 合约 (必配)
 	RelayerHot     types.Address // 归集专用热钱包 (nonce 归属 + 合约白名单调用方)
 	PayoutHot      types.Address // 提现热钱包 (水位对象)
-	ColdWallet     types.Address // 当前冷金库 (deployAndSweepBatch 目标)
 	GasBase        uint64        // 批次基础 gas (默认 80_000)
+	GasItem        uint64        // 每条目 gas (默认 sweepGasCap=120_000; 公网 CREATE2 部署成本更高, 可覆盖)
 	MaxFeePerGas   types.U256    // 归集 EIP-1559 费率
 	MaxPriorityFee types.U256
 	// PendingBatchTimeout PENDING 批次 (QueueIntent 曾失败, 尚无关联意图)
@@ -91,6 +97,9 @@ func (c *Config) withDefaults() {
 	if c.GasBase == 0 {
 		c.GasBase = 80_000
 	}
+	if c.GasItem == 0 {
+		c.GasItem = sweepGasCap
+	}
 	if c.PendingBatchTimeout <= 0 {
 		c.PendingBatchTimeout = 10 * time.Minute
 	}
@@ -104,7 +113,7 @@ type Sweeper struct {
 	db     *pgxpool.Pool
 	txm    ports.TxManager
 	chain  WaterQuerier // 可 nil — 跳过链上水位 (仅建批)
-	ledger ports.LedgerService
+	st     *store.Store // 冷金库动态解析 (platform_wallets ACTIVE COLD)
 	cfg    Config
 	log    *zap.Logger
 	alertf AlertFunc
@@ -116,12 +125,12 @@ type Sweeper struct {
 
 // New 构造 Sweeper.
 func New(db *pgxpool.Pool, txm ports.TxManager, wq WaterQuerier,
-	ledger ports.LedgerService, cfg Config, log *zap.Logger, alertf AlertFunc) *Sweeper {
+	st *store.Store, cfg Config, log *zap.Logger, alertf AlertFunc) *Sweeper {
 	cfg.withDefaults()
 	if log == nil {
 		log = zap.NewNop()
 	}
-	return &Sweeper{db: db, txm: txm, chain: wq, ledger: ledger,
+	return &Sweeper{db: db, txm: txm, chain: wq, st: st,
 		cfg: cfg, log: log, alertf: alertf, now: time.Now}
 }
 
@@ -196,18 +205,21 @@ type vaultBalance struct {
 
 // aggregateUnswept 计算 asset 下全部非隔离 vault 的精确未归集余额:
 //
-//	Σ FINALIZED 入站(to=vault, 含四分支全部类别 — 资金物理在 vault)
-//	− Σ SWEPT actual_swept_amount − Σ PENDING exact_sweep_amount.
+//	Σ FINALIZED+CREDITED+SWEPT 入站(to=vault — 历史全部已确认入站)
+//	− Σ SWEPT actual_swept_amount − Σ 存活批次 PENDING exact_sweep_amount.
+//
+// SWEPT 充值必须计入入站: 其资金虽已转出, 但出口由 item actual 扣减 —
+// 若入站排除 SWEPT, 同一笔会被双重扣减, vault 永久残留历史已扫总额.
 func (s *Sweeper) aggregateUnswept(ctx context.Context, asset, tokenContract string) ([]vaultBalance, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT da.id, da.address, da.create2_salt,
+		`SELECT uda.id, uda.address, uda.create2_salt,
 		        COALESCE(SUM(d.amount),0)::text
-		   FROM deposit_addresses da
+		   FROM user_deposit_addresses uda
 		   LEFT JOIN onchain_deposits d
-		     ON d.chain_id=da.chain_id AND d.to_address=da.address
-		    AND d.token_contract=$2 AND d.status='FINALIZED'
-		  WHERE da.chain_id=$1 AND da.is_quarantined=FALSE
-		  GROUP BY da.id, da.address, da.create2_salt`,
+		     ON d.chain_id=uda.chain_id AND d.to_address=uda.address
+		    AND d.token_contract=$2 AND d.status IN ('FINALIZED','CREDITED','SWEPT')
+		  WHERE uda.chain_id=$1 AND uda.is_quarantined=FALSE
+		  GROUP BY uda.id, uda.address, uda.create2_salt`,
 		int64(s.cfg.ChainID), tokenContract)
 	if err != nil {
 		return nil, err
@@ -268,12 +280,24 @@ func (s *Sweeper) aggregateUnswept(ctx context.Context, asset, tokenContract str
 }
 
 // SweepOnce 执行一轮聚合建批 (导出供测试直接驱动).
-// 先跑 reconcileBatches 释放/重派遗留批次, 再聚合 — 被释放的 vault 本轮
-// 即可重新进入归集候选 (B2).
+// 先跑 reconcileBatches 释放/重派遗留批次, 再动态解析本链 ACTIVE 冷金库
+// (platform_wallets CRUD 热生效) — 无 ACTIVE 冷金库时 CRITICAL 告警并
+// 跳过本轮 (不建批, 不失败退出, 下轮自动重试).
 func (s *Sweeper) SweepOnce(ctx context.Context) error {
 	if err := s.reconcileBatches(ctx); err != nil {
 		s.log.Warn("sweep batch reconcile failed", zap.Error(err))
 	}
+	colds, err := s.st.GetActiveColdWallets(ctx, s.cfg.ChainID)
+	if err != nil {
+		return fmt.Errorf("resolve active cold wallets: %w", err)
+	}
+	if len(colds) == 0 {
+		s.raise(Alert{Severity: "CRITICAL", Code: "NO_ACTIVE_COLD_WALLET",
+			Message: "no ACTIVE cold wallet configured for chain — sweep skipped this tick",
+			Detail:  fmt.Sprintf("chain=%d", s.cfg.ChainID)})
+		return nil
+	}
+	cold := colds[0].Address // 首个 ACTIVE (创建序); 轮换期并存时取最早
 	assets, err := s.assets(ctx)
 	if err != nil {
 		return err
@@ -292,7 +316,7 @@ func (s *Sweeper) SweepOnce(ctx context.Context) error {
 			if n > MaxBatchItems {
 				n = MaxBatchItems
 			}
-			if err := s.createBatch(ctx, a, vbs[:n]); err != nil {
+			if err := s.createBatch(ctx, a, vbs[:n], cold); err != nil {
 				return fmt.Errorf("create sweep batch %s: %w", a.symbol, err)
 			}
 			vbs = vbs[n:]
@@ -326,9 +350,12 @@ func (s *Sweeper) assets(ctx context.Context) ([]assetRow, error) {
 }
 
 // createBatch 单事务建批 + 入队 TxManager (nonce 分配 QUEUED, 随后自动首播).
-func (s *Sweeper) createBatch(ctx context.Context, a assetRow, vbs []vaultBalance) error {
-	if s.cfg.BatchSweeper == (types.Address{}) || s.cfg.ColdWallet == (types.Address{}) {
-		return fmt.Errorf("sweeper: BatchSweeper/ColdWallet address not configured")
+// cold 为本 tick 解析出的 ACTIVE 冷金库 (deployAndSweepBatch 目标, 落
+// target_cold_wallet 快照 — 后续重发/rebuild 按批次快照编码).
+func (s *Sweeper) createBatch(ctx context.Context, a assetRow, vbs []vaultBalance,
+	cold types.Address) error {
+	if s.cfg.BatchSweeper == (types.Address{}) || cold == (types.Address{}) {
+		return fmt.Errorf("sweeper: BatchSweeper/cold wallet address not configured")
 	}
 	total := new(big.Int)
 	items := make([]chain.SweepItem, 0, len(vbs))
@@ -337,7 +364,7 @@ func (s *Sweeper) createBatch(ctx context.Context, a assetRow, vbs []vaultBalanc
 		total.Add(total, vb.amount)
 	}
 	data, err := chain.EncodeDeployAndSweepBatch(items,
-		types.HexToAddress(a.contract), s.cfg.ColdWallet)
+		types.HexToAddress(a.contract), cold)
 	if err != nil {
 		return err
 	}
@@ -347,7 +374,7 @@ func (s *Sweeper) createBatch(ctx context.Context, a assetRow, vbs []vaultBalanc
 		if err := tx.QueryRow(ctx,
 			`INSERT INTO sweep_batches (chain_id, asset_symbol, target_cold_wallet, status)
 			 VALUES ($1,$2,$3,'PENDING') RETURNING id`,
-			int64(s.cfg.ChainID), a.symbol, addrStr(s.cfg.ColdWallet)).Scan(&batchID); err != nil {
+			int64(s.cfg.ChainID), a.symbol, addrStr(cold)).Scan(&batchID); err != nil {
 			return err
 		}
 		for _, vb := range vbs {
@@ -364,7 +391,7 @@ func (s *Sweeper) createBatch(ctx context.Context, a assetRow, vbs []vaultBalanc
 	}
 
 	// 入队 TxManager — relayer 热钱包 nonce; 合约要求 msg.sender==relayerHot.
-	gas := s.cfg.GasBase + sweepGasCap*uint64(len(items))
+	gas := s.cfg.GasBase + s.cfg.GasItem*uint64(len(items))
 	_, err = s.txm.QueueIntent(ctx, ports.QueueIntentRequest{
 		IntentType:           types.IntentTypeSweepBatch,
 		ReferenceID:          batchID,
@@ -587,7 +614,7 @@ func (s *Sweeper) requeuePendingBatch(ctx context.Context, batchID uuid.UUID, cr
 	if err != nil {
 		return err
 	}
-	gas := s.cfg.GasBase + sweepGasCap*uint64(nItems)
+	gas := s.cfg.GasBase + s.cfg.GasItem*uint64(nItems)
 	_, qerr := s.txm.QueueIntent(ctx, ports.QueueIntentRequest{
 		IntentType:           types.IntentTypeSweepBatch,
 		ReferenceID:          batchID,
@@ -637,9 +664,9 @@ func (s *Sweeper) encodeBatchCalldata(ctx context.Context, batchID uuid.UUID) ([
 		return nil, 0, fmt.Errorf("resolve token %s@%d: %w", asset, s.cfg.ChainID, err)
 	}
 	rows, err := s.db.Query(ctx,
-		`SELECT da.create2_salt, i.exact_sweep_amount::text
+		`SELECT uda.create2_salt, i.exact_sweep_amount::text
 		   FROM sweep_batch_items i
-		   JOIN deposit_addresses da ON da.id = i.deposit_address_id
+		   JOIN user_deposit_addresses uda ON uda.id = i.deposit_address_id
 		  WHERE i.batch_id=$1 AND i.item_status='PENDING' ORDER BY i.id`, batchID)
 	if err != nil {
 		return nil, 0, err

@@ -10,17 +10,22 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN go build -trimpath -ldflags="-s -w" -o /out/gateway-core ./cmd/server
+RUN go build -trimpath -ldflags="-s -w" -o /out/gateway ./cmd/gateway \
+    && go build -trimpath -ldflags="-s -w" -o /out/backend ./cmd/backend \
+    && go build -trimpath -ldflags="-s -w" -o /out/indexer ./cmd/indexer
 
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY --from=build /out/gateway-core /app/gateway-core
+COPY --from=build /out/gateway /app/gateway
+COPY --from=build /out/backend /app/backend
+COPY --from=build /out/indexer /app/indexer
 COPY migrations /app/migrations
 ENV MIGRATIONS_DIR=/app/migrations \
     PORT=8080
 EXPOSE 8080
-# 迁移在进程启动路径内执行 (main.go runMigrations), 无需单独 init 容器.
-ENTRYPOINT ["/app/gateway-core"]
+# 迁移在 gateway 进程启动路径内执行 (cmd/gateway runMigrations), 无需单独 init 容器.
+# backend/indexer 经 compose entrypoint 覆盖为对应二进制.
+ENTRYPOINT ["/app/gateway"]

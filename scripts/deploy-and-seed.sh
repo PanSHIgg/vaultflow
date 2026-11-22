@@ -30,8 +30,6 @@ GATEWAY_ENV="$DEPLOY_DIR/gateway.env"
 SIGNER_CFG="$DEPLOY_DIR/signer-config.json"
 SEED_SQL="$DEPLOY_DIR/seed.sql"
 ADMIN_KEYS="$DEPLOY_DIR/admin-ed25519.json"
-SMOKE_WL="$DEPLOY_DIR/smoke-whitelist-request.json"
-MERCHANT_KEYS="$DEPLOY_DIR/merchant-demo.json"
 
 FRESH=0
 [ "${1:-}" = "--fresh" ] && FRESH=1
@@ -72,7 +70,6 @@ B_RELAYER=$(addr_of "$B_RELAYER_PK" | tr 'A-F' 'a-f')
 B_PAYOUT=$(addr_of  "$B_PAYOUT_PK"  | tr 'A-F' 'a-f')
 A_COLD=0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc   # anvil #2
 B_COLD=0x976ea74026e726554db657fa54763abd0c3a0aa9   # anvil #6
-SMOKE_RECIPIENT=0xa0ee7a142d267c1f36714e4a8f75612f20a79720 # anvil #9 (客户提现地址)
 
 RPC_A=http://127.0.0.1:8545
 RPC_B=http://127.0.0.1:8546
@@ -111,11 +108,12 @@ DOCKERFILE
 #     为网络正常环境的 canonical 路径).
 if [ ! -x "$DEPLOY_DIR/vault-signer" ] || [ "$FRESH" = "1" ]; then
     log "building vault-signer in WSL (cargo --release)"
-    (cd "$ROOT/services/vault-signer" && cargo build --release --locked --bin vault-signer) \
+    (cd "$ROOT/services/vault-signer" && cargo build --release --locked --bin vault-signer --bin signer-cli) \
         || die "WSL cargo build of vault-signer failed"
     cp "$ROOT/services/vault-signer/target/release/vault-signer" "$DEPLOY_DIR/vault-signer"
-    chmod +x "$DEPLOY_DIR/vault-signer"
-    log "copied vault-signer binary into deploy/"
+    cp "$ROOT/services/vault-signer/target/release/signer-cli" "$DEPLOY_DIR/signer-cli"
+    chmod +x "$DEPLOY_DIR/vault-signer" "$DEPLOY_DIR/signer-cli"
+    log "copied vault-signer + signer-cli binaries into deploy/"
 fi
 cat > "$DEPLOY_DIR/Dockerfile.signer" <<'DOCKERFILE'
 # ubuntu:24.04 = glibc 2.39 — 与 WSL cargo 编译产物所需符号版本匹配.
@@ -123,6 +121,7 @@ FROM ubuntu:24.04
 RUN useradd -r -u 10001 -m vaultsigner
 WORKDIR /var/lib/vault-signer
 COPY vault-signer /usr/local/bin/vault-signer
+COPY signer-cli /usr/local/bin/signer-cli
 ENV VAULT_SIGNER_CONFIG=/etc/vaultflow/signer-config.json
 EXPOSE 50051
 USER vaultsigner
@@ -426,8 +425,7 @@ env = {
     "MTLS_CA_CERT": "/etc/vaultflow/certs/ca/ca.crt",
     "MTLS_SERVER_NAME": "vault-signer",
     "ADMIN_JWT_SECRET": "vaultflow-dev-admin-secret",
-    "ENABLE_DEV_SIMULATOR": "true",
-    "WEBHOOK_ALLOW_INSECURE_HTTP": "true",
+    "JWT_SECRET": "vaultflow-dev-user-secret",
     "MIGRATIONS_DIR": "/app/migrations",
     "PORT": "8080",
     "CHAIN_CONFIG_JSON": json.dumps(ccj, separators=(",", ":")),
@@ -456,70 +454,53 @@ for f in services/gateway-core/migrations/*.sql; do
 done
 
 # ---------------------------------------------------------------------------
-# 13. 种子: 商户 + API key + supported_assets + 金库储备账本行
+# 13. 种子: supported_assets + platform_wallets + 游标锚定 (交易所托管模型)
 # ---------------------------------------------------------------------------
-MERCHANT_ID=11111111-2222-3333-4444-555555555555
-if [ ! -f "$MERCHANT_KEYS" ]; then
-    python3 - "$MERCHANT_KEYS" <<'PY'
-import hashlib, json, secrets, sys
-key = "vf_demo_" + secrets.token_hex(24)
-json.dump({"api_key": key, "api_key_hash": hashlib.sha256(key.encode()).hexdigest()},
-          open(sys.argv[1], "w"), indent=2)
-PY
-fi
-API_KEY=$(python3 -c 'import json;print(json.load(open("'"$MERCHANT_KEYS"'"))["api_key"])')
-API_KEY_HASH=$(python3 -c 'import json;print(json.load(open("'"$MERCHANT_KEYS"'"))["api_key_hash"])')
-
 # 游标种子: 用真实 genesis hash 锚定 — 防止 indexer 首启在 anvil 状态未恢复
 # 窗口把游标锚成 (0, 0x00..0) 后首块父哈希校验误判 FORK_DEPTH_EXCEEDED.
 GENESIS_A=$(cast rpc eth_getBlockByNumber 0x0 false --rpc-url "$RPC_A" | python3 -c 'import json,sys;print(json.load(sys.stdin)["hash"])')
 GENESIS_B=$(cast rpc eth_getBlockByNumber 0x0 false --rpc-url "$RPC_B" | python3 -c 'import json,sys;print(json.load(sys.stdin)["hash"])')
 
-# FIX-G BUG-3: 原生 gas 注资账 — 逐热钱包查询真实链上 ETH 余额 (wei 十进制,
-# 超 int64 故在 python 端合计). GAS_SETTLE 每笔出站结算 CR HOT_WALLET_NATIVE;
-# 种子漏记本科目期初注资会让首笔 GAS_SETTLE 因余额不足回滚整个业务结算.
-NAT_A_RELAYER=$(cast balance "$A_RELAYER" --rpc-url "$RPC_A")
-NAT_A_PAYOUT=$(cast balance "$A_PAYOUT" --rpc-url "$RPC_A")
-NAT_B_RELAYER=$(cast balance "$B_RELAYER" --rpc-url "$RPC_B")
-NAT_B_PAYOUT=$(cast balance "$B_PAYOUT" --rpc-url "$RPC_B")
-
-python3 - "$SEED_SQL" "$DEPLOYED_JSON" "$MERCHANT_ID" "$API_KEY_HASH" \
-        "$A_COLD" "$B_COLD" "$RESERVE" "$GENESIS_A" "$GENESIS_B" \
-        "$NAT_A_RELAYER" "$NAT_A_PAYOUT" "$NAT_B_RELAYER" "$NAT_B_PAYOUT" <<'PY'
+python3 - "$SEED_SQL" "$DEPLOYED_JSON" \
+        "$A_RELAYER" "$A_PAYOUT" "$A_COLD" "$B_RELAYER" "$B_PAYOUT" "$B_COLD" \
+        "$GENESIS_A" "$GENESIS_B" <<'PY'
 import json, sys
-out, dep, mid, khash = sys.argv[1], json.load(open(sys.argv[2])), sys.argv[3], sys.argv[4]
-ca, cb, reserve = sys.argv[5], sys.argv[6], int(sys.argv[7])
-gen_a, gen_b = sys.argv[8], sys.argv[9]
-# FIX-G BUG-3: 真实链上热钱包 ETH 合计 (wei) — 注资账本金额权威来源.
-nat = {"31337": int(sys.argv[10]) + int(sys.argv[11]),
-       "31338": int(sys.argv[12]) + int(sys.argv[13])}
+out, dep = sys.argv[1], json.load(open(sys.argv[2]))
+ra, pa, ca, rb, pb, cb = [a.lower() for a in sys.argv[3:9]]
+gen_a, gen_b = sys.argv[9], sys.argv[10]
 C = dep["chains"]
+chain_name = {"31337": "Anvil A", "31338": "Anvil B"}
 sa = []
 for cid in ("31337", "31338"):
-    sa.append("(%s,'USDT','%s',6,false)" % (cid, C[cid]["usdt"]))
-    sa.append("(%s,'USDC','%s',6,true)"  % (cid, C[cid]["usdc"]))
-acct = []
-for cid in ("31337", "31338"):
-    for sym in ("USDT", "USDC"):
-        acct.append("('00000000-0000-0000-0000-000000000000',%s,'%s','CUSTODY_COLD','DEBIT',%d)" % (cid, sym, reserve))
-        acct.append("('00000000-0000-0000-0000-000000000000',%s,'%s','TREASURY_EQUITY_CAPITAL','CREDIT',%d)" % (cid, sym, reserve))
-sql = f"""-- deploy-and-seed.sh generated — idempotent dev seed
-INSERT INTO merchants (id, name, api_key_hash, webhook_url, webhook_secret_enc, fee_rate_bps)
-VALUES ('{mid}', 'Demo Merchant', '{khash}', NULL, NULL, 25)
-ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, api_key_hash = EXCLUDED.api_key_hash;
+    for sym, eip in (("USDT", "false"), ("USDC", "true")):
+        tok = C[cid][sym.lower()]
+        sa.append("(%s,'%s','%s',6,%s,1000000,'%s',1,1,'')" %
+                  (cid, sym, tok, eip, chain_name[cid]))
+pw = []
+for cid, relayer, payout, cold in (("31337", ra, pa, ca), ("31338", rb, pb, cb)):
+    for role, addr in (("RELAYER", relayer), ("PAYOUT", payout), ("COLD", cold)):
+        pw.append("(%s,'%s','%s','ACTIVE')" % (cid, role, addr))
+sql = f"""-- deploy-and-seed.sh generated — idempotent dev seed (exchange custody model)
 
-INSERT INTO supported_assets (chain_id, asset_symbol, token_contract, decimals, supports_eip3009)
+INSERT INTO supported_assets (chain_id, asset_symbol, token_contract, decimals, supports_eip3009,
+                              min_deposit, chain_name, block_time_seconds, required_confirmations,
+                              token_explorer_url)
 VALUES {",".join(sa)}
 ON CONFLICT (chain_id, asset_symbol) DO UPDATE
     SET token_contract = EXCLUDED.token_contract,
         decimals = EXCLUDED.decimals,
-        supports_eip3009 = EXCLUDED.supports_eip3009;
+        supports_eip3009 = EXCLUDED.supports_eip3009,
+        min_deposit = EXCLUDED.min_deposit,
+        chain_name = EXCLUDED.chain_name,
+        block_time_seconds = EXCLUDED.block_time_seconds,
+        required_confirmations = EXCLUDED.required_confirmations,
+        token_explorer_url = EXCLUDED.token_explorer_url;
 
--- 平台金库储备 (系统哨兵商户) — 与链上 cold wallet mint 额对齐
-INSERT INTO ledger_accounts (owner_merchant_id, chain_id, asset_symbol, account_type, normal_side, balance)
-VALUES {",".join(acct)}
-ON CONFLICT (owner_merchant_id, chain_id, asset_symbol, account_type)
-    DO UPDATE SET balance = EXCLUDED.balance;
+-- 平台热/冷钱包 (admin CRUD 可管理; COLD 白名单以 signer DB 为准,
+-- 此处仅为初始供应 — signer-config.allowed_cold_wallets 同址引导).
+INSERT INTO platform_wallets (chain_id, role, address, status)
+VALUES {",".join(pw)}
+ON CONFLICT (chain_id, role, address) DO UPDATE SET status = EXCLUDED.status;
 
 -- 游标锚定: 仅在“首启误锚 (height=0, hash=0x0)”或空表时修正为真实 genesis hash;
 -- 已推进的游标不动 (幂等重跑不打断同步进度).
@@ -531,103 +512,33 @@ ON CONFLICT (chain_id) DO UPDATE
       AND chain_sync_cursors.latest_synced_hash =
           '0x0000000000000000000000000000000000000000000000000000000000000000';
 """
-
-def topup_block(cid, target):
-    # FIX-G BUG-3: TREASURY_TOPUP 模板合法腿
-    # (DR HOT_WALLET_NATIVE / CR TREASURY_EQUITY_CAPITAL), 金额 = 链上真实
-    # 热钱包 ETH 合计 (wei). 重跑按差额补足 (幂等 + 兼容 --fresh 后旧账漂移);
-    # ledger 延迟约束在语句提交时校验 balance_after 链 — 单 DO 块自洽.
-    return """-- FIX-G BUG-3: hot-wallet native ETH gas funding for chain {cid}
--- (real on-chain aggregate = {target} wei at seed time).
-DO $$
-DECLARE
-    v_txn  uuid;
-    v_bal  numeric(78,0);
-    v_acct uuid;
-    v_aft  numeric(78,0);
-BEGIN
-    SELECT balance INTO v_bal FROM ledger_accounts
-     WHERE owner_merchant_id = '00000000-0000-0000-0000-000000000000'
-       AND chain_id = {cid} AND asset_symbol = 'ETH'
-       AND account_type = 'HOT_WALLET_NATIVE'
-     FOR UPDATE;
-    v_bal := COALESCE(v_bal, 0);
-    IF v_bal >= {target} THEN
-        RETURN;  -- 已注资到位 (幂等重跑)
-    END IF;
-    INSERT INTO ledger_transactions (reference_type, reference_id, description)
-    VALUES ('TREASURY_TOPUP', 'seed:hot-native:{cid}:' || ({target} - v_bal)::text,
-            'deploy seed: initial hot-wallet native gas funding (delta to on-chain total)')
-    RETURNING id INTO v_txn;
-    INSERT INTO ledger_accounts (owner_merchant_id, chain_id, asset_symbol, account_type, normal_side, balance)
-    VALUES ('00000000-0000-0000-0000-000000000000', {cid}, 'ETH', 'HOT_WALLET_NATIVE', 'DEBIT', {target} - v_bal)
-    ON CONFLICT (owner_merchant_id, chain_id, asset_symbol, account_type)
-      DO UPDATE SET balance = ledger_accounts.balance + EXCLUDED.balance
-    RETURNING id, balance INTO v_acct, v_aft;
-    INSERT INTO ledger_entries (transaction_id, account_id, direction, amount, balance_after)
-    VALUES (v_txn, v_acct, 'DEBIT', {target} - v_bal, v_aft);
-    INSERT INTO ledger_accounts (owner_merchant_id, chain_id, asset_symbol, account_type, normal_side, balance)
-    VALUES ('00000000-0000-0000-0000-000000000000', {cid}, 'ETH', 'TREASURY_EQUITY_CAPITAL', 'CREDIT', {target} - v_bal)
-    ON CONFLICT (owner_merchant_id, chain_id, asset_symbol, account_type)
-      DO UPDATE SET balance = ledger_accounts.balance + EXCLUDED.balance
-    RETURNING id, balance INTO v_acct, v_aft;
-    INSERT INTO ledger_entries (transaction_id, account_id, direction, amount, balance_after)
-    VALUES (v_txn, v_acct, 'CREDIT', {target} - v_bal, v_aft);
-END $$;
-""".format(cid=cid, target=target)
-
-sql += topup_block("31337", nat["31337"])
-sql += topup_block("31338", nat["31338"])
 open(out, "w").write(sql)
 PY
 # --fresh: anvil 已整链清空 — DB 中一切链派生与每轮业务状态必须同步归零,
 # 否则旧 chain_sync_cursors.latest_synced_height > 新链 latest 使
 # Pool.Heights 的滞后节点剔除把全部节点当轮踢空 -> ErrNoQuorum 永久死锁
-# (旧 genesis hash 亦会让分叉扫描找不到公共祖先). merchants/supported_assets
-# 等配置类行由下方 seed 幂等重建, 不在重置集内.
+# (旧 genesis hash 亦会让分叉扫描找不到公共祖先). users/user_deposit_addresses
+# 保留 — CREATE2 推导对同一 (chainId,userId) 恒定, 地址不漂移; user_balances
+# 归零 (链上资金已随链态清空). supported_assets/platform_wallets 为配置行,
+# 由下方 seed 幂等重建.
 if [ "$FRESH" = "1" ]; then
     docker compose exec -T postgres psql -U vaultflow -d vaultflow -v ON_ERROR_STOP=1 -c \
         "TRUNCATE chain_sync_cursors, chain_blocks, onchain_deposits,
-                  deposit_addresses, payment_orders, merchant_payouts,
                   outbound_tx_attempts, outbound_tx_intents, wallet_nonce_cursors,
-                  sweep_batch_items, sweep_batches, webhook_outbox,
-                  signer_audit_anchor, merchant_withdrawal_addresses,
-                  ledger_entries, ledger_transactions, ledger_accounts
+                  sweep_batch_items, sweep_batches, signer_audit_anchor,
+                  user_balances
          RESTART IDENTITY CASCADE" >/dev/null
     log "--fresh: reset chain-derived + business domain tables"
 fi
 
 docker compose exec -T postgres psql -U vaultflow -d vaultflow -v ON_ERROR_STOP=1 -f - < "$SEED_SQL" >/dev/null
-log "seeded merchant $MERCHANT_ID + supported_assets(4) + ledger reserve accounts(8)" \
-    "+ HOT_WALLET_NATIVE gas funding (A=${NAT_A_RELAYER}+${NAT_A_PAYOUT} B=${NAT_B_RELAYER}+${NAT_B_PAYOUT} wei)"
+log "seeded supported_assets(4) + platform_wallets(6: 2x RELAYER/PAYOUT/COLD)"
 
 # ---------------------------------------------------------------------------
-# 14. 冒烟白名单请求 (admin Ed25519 签好的 69B ADDR_V1 载荷演示)
+# 14. 汇总
 # ---------------------------------------------------------------------------
-python3 - "$ADMIN_KEYS" "$SMOKE_WL" "$MERCHANT_ID" "$SMOKE_RECIPIENT" <<'PY'
-import json, sys, time, uuid
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from cryptography.hazmat.primitives import serialization
-keys = json.load(open(sys.argv[1]))
-mid, recipient = sys.argv[3], sys.argv[4]
-sk = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(keys["private_key_hex"]))
-valid_until = int(time.time()) + 30 * 86400
-payload = (b"VAULTFLOW_ADDR_V1" + (31337).to_bytes(8, "big")
-           + uuid.UUID(mid).bytes + bytes.fromhex(recipient.removeprefix("0x"))
-           + valid_until.to_bytes(8, "big"))
-assert len(payload) == 69
-sig = sk.sign(payload).hex()
-json.dump({"chain_id": 31337, "address": recipient,
-           "valid_until_unix": valid_until, "admin_signature": sig},
-          open(sys.argv[2], "w"), indent=2)
-PY
-log "wrote smoke whitelist request -> $SMOKE_WL"
-
-# ---------------------------------------------------------------------------
-# 15. 汇总
-# ---------------------------------------------------------------------------
-python3 - "$DEPLOYED_JSON" "$IMPL" "$ICH_A" "$MERCHANT_ID" "$API_KEY" \
-        "$A_RELAYER" "$A_PAYOUT" "$B_RELAYER" "$B_PAYOUT" <<'PY'
+python3 - "$DEPLOYED_JSON" "$IMPL" "$ICH_A" \
+        "$A_RELAYER" "$A_PAYOUT" "$A_COLD" "$B_RELAYER" "$B_PAYOUT" "$B_COLD" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
 print("""
@@ -637,22 +548,22 @@ factory       : %s    impl: %s
 initCodeHash  : %s
 chain 31337   : usdt=%s usdc=%s sweeper=%s router=%s
 chain 31338   : usdt=%s usdc=%s sweeper=%s router=%s
-hot wallets   : A.relayer=%s A.payout=%s
-                B.relayer=%s B.payout=%s
-merchant      : %s
-api key       : %s   (X-Api-Key header; deploy/merchant-demo.json)
+wallets A     : relayer=%s payout=%s cold=%s
+wallets B     : relayer=%s payout=%s cold=%s
 artifacts     : deploy/{gateway.env,signer-config.json,signer-data/,deployed.json,
-                admin-ed25519.json,seed.sql,smoke-whitelist-request.json}
+                admin-ed25519.json,seed.sql}
 next          : docker compose up --build -d
 smoke         : curl -sf localhost:8080/healthz
-                curl -X POST localhost:8080/v1/orders -H 'X-Api-Key: <api key>'
-                     -H 'Idempotency-Key: <uuid>' -d '{"chain_id":31337,"asset_symbol":"USDC","amount":"1000000"}'
+                curl -sf localhost:8080/v1/assets
+                curl -X POST localhost:8080/v1/auth/register
+                     -H 'content-type: application/json'
+                     -d '{"email":"demo@vaultflow.dev","password":"demopass1"}'
 ===============================================================""" % (
     d["chains"]["31337"]["factory"], sys.argv[2], sys.argv[3],
     d["chains"]["31337"]["usdt"], d["chains"]["31337"]["usdc"],
     d["chains"]["31337"]["sweeper"], d["chains"]["31337"]["router"],
     d["chains"]["31338"]["usdt"], d["chains"]["31338"]["usdc"],
     d["chains"]["31338"]["sweeper"], d["chains"]["31338"]["router"],
-    sys.argv[6], sys.argv[7], sys.argv[8], sys.argv[9],
-    sys.argv[4], sys.argv[5]))
+    sys.argv[4], sys.argv[5], sys.argv[6],
+    sys.argv[7], sys.argv[8], sys.argv[9]))
 PY

@@ -238,13 +238,10 @@ func (m *Manager) Stop() {
 const liveIntentStatuses = `'QUEUED','IN_FLIGHT','INCLUDED_PENDING_SAFE','CONFIRMED','NONCE_STOLEN_HALT'`
 
 // idempotentRefType 该意图类型是否受 (intent_type, reference_id) 存活唯一约束
-// (003 迁移); NONCE_GAP_FILLER 的 reference_id 语义不同, 不受约束.
+// (008 重建的 uq_intents_live_type_ref 仅覆盖 SWEEP_BATCH);
+// NONCE_GAP_FILLER 的 reference_id 语义不同, 不受约束.
 func idempotentRefType(t types.IntentType) bool {
-	switch t {
-	case types.IntentTypeSweepBatch, types.IntentTypeMerchantPayout, types.IntentTypeEIP3009Relay:
-		return true
-	}
-	return false
+	return t == types.IntentTypeSweepBatch
 }
 
 // QueueIntent 同事务分配连续 Nonce 并落 QUEUED 意图, 随后通知派发协程首播.

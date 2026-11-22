@@ -8,10 +8,10 @@ import (
 	"vaultflow/gateway-core/internal/types"
 )
 
-// TxManager 交易生命周期引擎 (W4 txmanager 实现): PG 持久化 Nonce 分配、
+// TxManager 交易生命周期引擎 (txmanager 实现): PG 持久化 Nonce 分配、
 // EIP-1559 组装、Signer 策略签名、广播、RBF/Dropped/带外占用检测与
-// GAP_FILLER 在途取消. 消费方: W4 sweeper/indexer, W3 order (经 payout 编排),
-// W5 监控台.
+// GAP_FILLER 在途取消. 消费方: sweeper (SWEEP_BATCH 入队), cmd/backend
+// 装配面.
 type TxManager interface {
 	// QueueIntent 同事务分配连续 Nonce 落 QUEUED 意图并触发首播流水线.
 	// 该钱包队列已 NONCE_STOLEN_HALT 熔断时返回 ErrNonceHalted.
@@ -34,4 +34,39 @@ type TxManager interface {
 
 	// NonceCursorStatus 查询热钱包 Nonce 游标与熔断状态 (监控台观测).
 	NonceCursorStatus(ctx context.Context, chainID types.ChainID, wallet types.Address) (NonceCursorStatus, error)
+}
+
+// ===========================================================================
+// TxManager DTO
+// ===========================================================================
+
+// QueueIntentRequest 出站意图入队.
+// 实现端 (txmanager) 在 PG 事务内对 wallet_nonce_cursors SELECT FOR UPDATE
+// 分配连续 Nonce 并落 QUEUED 意图; 随后组装 EIP-1559 未签名交易请求
+// vault-signer 策略签名并广播. Calldata 由调用方 ABI 编码
+// (sweeper 编 deployAndSweepBatch).
+// 交易所托管模型下 intent_type 仅 SWEEP_BATCH / NONCE_GAP_FILLER.
+type QueueIntentRequest struct {
+	IntentType           types.IntentType
+	ReferenceID          uuid.UUID // sweep_batch_id (SWEEP_BATCH)
+	ChainID              types.ChainID
+	WalletAddress        types.Address // 出站热钱包 (Nonce 归属)
+	To                   types.Address
+	Value                types.U256 // 合约调用恒为 0
+	Calldata             []byte
+	GasLimit             uint64
+	MaxFeePerGas         types.U256
+	MaxPriorityFeePerGas types.U256
+	// RetrySeq/RefundTicket 为 signer 幂等槽保留字段 (交易所模型当前未用).
+	RetrySeq     uint32
+	RefundTicket *RefundTicket
+}
+
+// NonceCursorStatus 热钱包 Nonce 游标与熔断状态.
+type NonceCursorStatus struct {
+	ChainID         types.ChainID
+	WalletAddress   types.Address
+	NextNonce       uint64
+	InFlightIntents int  // 在途意图数
+	Halted          bool // 存在 NONCE_STOLEN_HALT 意图 = true (暂停调度)
 }

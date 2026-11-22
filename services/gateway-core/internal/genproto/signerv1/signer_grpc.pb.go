@@ -24,6 +24,10 @@ const (
 	VaultSignerService_SignTransaction_FullMethodName           = "/signer.v1.VaultSignerService/SignTransaction"
 	VaultSignerService_VerifyAuditChain_FullMethodName          = "/signer.v1.VaultSignerService/VerifyAuditChain"
 	VaultSignerService_GetSignerHealth_FullMethodName           = "/signer.v1.VaultSignerService/GetSignerHealth"
+	VaultSignerService_GenerateWallet_FullMethodName            = "/signer.v1.VaultSignerService/GenerateWallet"
+	VaultSignerService_UpdateColdWallets_FullMethodName         = "/signer.v1.VaultSignerService/UpdateColdWallets"
+	VaultSignerService_ListWallets_FullMethodName               = "/signer.v1.VaultSignerService/ListWallets"
+	VaultSignerService_ListColdWallets_FullMethodName           = "/signer.v1.VaultSignerService/ListColdWallets"
 )
 
 // VaultSignerServiceClient is the client API for VaultSignerService service.
@@ -43,6 +47,15 @@ type VaultSignerServiceClient interface {
 	// signed_payload 为 69B Ed25519 载荷 (见 Rejection/文档约定):
 	//   "VAULTFLOW_ADDR_V1"(17B) || chain_id u64BE(8) || merchant_uuid(16)
 	//   || recipient_address(20) || valid_until_unix u64BE(8)
+	// 语义固化 (审计 FIX-C 裁决, 不改 wire):
+	//   * 注册仅校验 Ed25519 有效性——已过期 (valid_until <= now) 的租期载荷
+	//     仍被接受并落审计链 (留痕); 签名时才以 WHITELIST_EXPIRED 拦截。
+	//   * 已吊销 (REVOKED) 条目不得被"同一签名的历史载荷"重放复活: signer 为
+	//     每条目保存全部已接受签名历史, 重放任何旧签名 (含被取代租约) 一律
+	//     以 WHITELIST_REVOKED 拒绝。仅当随附签名为该条目从未见过的全新管理
+	//     员审批 (Ed25519 对同一密钥确定性 => 签名不同即载荷字段已变, 如新
+	//     valid_until) 才允许复活, 且 first_seen_at 重新锚定 -> 新租约重新
+	//     服满 cooldown_secs 冷却期 (§1.2 新审批新冷却)。
 	RegisterWithdrawalAddress(ctx context.Context, in *RegisterWithdrawalAddressRequest, opts ...grpc.CallOption) (*RegisterWithdrawalAddressResponse, error)
 	// 紧急吊销提现白名单地址。供管理员经 mTLS 直连调用;
 	// 只影响可用性不触及资金, 故不强制 Ed25519 自证, 但全程落审计链。
@@ -55,9 +68,27 @@ type VaultSignerServiceClient interface {
 	// 从创世记录逐条重算 SHA-256 审计哈希链。
 	// entry_hash = SHA256(seq || timestamp || action || request_digest
 	//                     || decision || reason || prev_hash)
+	// 注意 (FIX-C 固化): 本校验对"尾部截断"不可知——删除末尾记录后剩余链仍
+	// 哈希自洽返回 valid=true。巡检方必须将返回的 tip_hash / entries_checked
+	// 与自身持久化的上次链头比对, 才能发现尾部删除。
 	VerifyAuditChain(ctx context.Context, in *VerifyAuditChainRequest, opts ...grpc.CallOption) (*VerifyAuditChainResponse, error)
 	// 健康度与运行态巡检 (版本 / 时钟 / 白名单规模 / 审计链 tip)。
 	GetSignerHealth(ctx context.Context, in *GetSignerHealthRequest, opts ...grpc.CallOption) (*GetSignerHealthResponse, error)
+	// 生成新的热钱包密钥对 (RELAYER/PAYOUT)。signer 经 KMS 生成 secp256k1
+	// 私钥, AES-256-GCM 信封加密落 encrypted_keys, 仅返回派生地址。
+	// 私钥永不离开 signer 进程边界。role 仅接受 "RELAYER"/"PAYOUT"。
+	GenerateWallet(ctx context.Context, in *GenerateWalletRequest, opts ...grpc.CallOption) (*GenerateWalletResponse, error)
+	// 动态更新指定链的冷钱包白名单 (COLD 增删)。幂等; 持久化到 signer
+	// 本地 SQLite cold_wallets 表, 立即影响后续 SWEEP 策略校验。
+	// 轮换窗口 = 新旧地址同时存在于白名单。
+	UpdateColdWallets(ctx context.Context, in *UpdateColdWalletsRequest, opts ...grpc.CallOption) (*UpdateColdWalletsResponse, error)
+	// 热钱包清单 (signer-cli 运维面的"查") — 仅元数据: 地址 / 角色
+	// 标签 / 创建时间 / 密钥是否已装载可签名。永不返回私钥材料。
+	// 热钱包只增不删 — 密钥均为派生品, 无"改"语义, 故无 Remove RPC。
+	ListWallets(ctx context.Context, in *ListWalletsRequest, opts ...grpc.CallOption) (*ListWalletsResponse, error)
+	// 查询指定链当前生效的冷钱包白名单 (DB 权威 — 含运行期增删后的
+	// 最新状态, 不受 boot-seed config 影响)。
+	ListColdWallets(ctx context.Context, in *ListColdWalletsRequest, opts ...grpc.CallOption) (*ListColdWalletsResponse, error)
 }
 
 type vaultSignerServiceClient struct {
@@ -118,6 +149,46 @@ func (c *vaultSignerServiceClient) GetSignerHealth(ctx context.Context, in *GetS
 	return out, nil
 }
 
+func (c *vaultSignerServiceClient) GenerateWallet(ctx context.Context, in *GenerateWalletRequest, opts ...grpc.CallOption) (*GenerateWalletResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GenerateWalletResponse)
+	err := c.cc.Invoke(ctx, VaultSignerService_GenerateWallet_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vaultSignerServiceClient) UpdateColdWallets(ctx context.Context, in *UpdateColdWalletsRequest, opts ...grpc.CallOption) (*UpdateColdWalletsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpdateColdWalletsResponse)
+	err := c.cc.Invoke(ctx, VaultSignerService_UpdateColdWallets_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vaultSignerServiceClient) ListWallets(ctx context.Context, in *ListWalletsRequest, opts ...grpc.CallOption) (*ListWalletsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListWalletsResponse)
+	err := c.cc.Invoke(ctx, VaultSignerService_ListWallets_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *vaultSignerServiceClient) ListColdWallets(ctx context.Context, in *ListColdWalletsRequest, opts ...grpc.CallOption) (*ListColdWalletsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListColdWalletsResponse)
+	err := c.cc.Invoke(ctx, VaultSignerService_ListColdWallets_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // VaultSignerServiceServer is the server API for VaultSignerService service.
 // All implementations must embed UnimplementedVaultSignerServiceServer
 // for forward compatibility.
@@ -135,6 +206,15 @@ type VaultSignerServiceServer interface {
 	// signed_payload 为 69B Ed25519 载荷 (见 Rejection/文档约定):
 	//   "VAULTFLOW_ADDR_V1"(17B) || chain_id u64BE(8) || merchant_uuid(16)
 	//   || recipient_address(20) || valid_until_unix u64BE(8)
+	// 语义固化 (审计 FIX-C 裁决, 不改 wire):
+	//   * 注册仅校验 Ed25519 有效性——已过期 (valid_until <= now) 的租期载荷
+	//     仍被接受并落审计链 (留痕); 签名时才以 WHITELIST_EXPIRED 拦截。
+	//   * 已吊销 (REVOKED) 条目不得被"同一签名的历史载荷"重放复活: signer 为
+	//     每条目保存全部已接受签名历史, 重放任何旧签名 (含被取代租约) 一律
+	//     以 WHITELIST_REVOKED 拒绝。仅当随附签名为该条目从未见过的全新管理
+	//     员审批 (Ed25519 对同一密钥确定性 => 签名不同即载荷字段已变, 如新
+	//     valid_until) 才允许复活, 且 first_seen_at 重新锚定 -> 新租约重新
+	//     服满 cooldown_secs 冷却期 (§1.2 新审批新冷却)。
 	RegisterWithdrawalAddress(context.Context, *RegisterWithdrawalAddressRequest) (*RegisterWithdrawalAddressResponse, error)
 	// 紧急吊销提现白名单地址。供管理员经 mTLS 直连调用;
 	// 只影响可用性不触及资金, 故不强制 Ed25519 自证, 但全程落审计链。
@@ -147,9 +227,27 @@ type VaultSignerServiceServer interface {
 	// 从创世记录逐条重算 SHA-256 审计哈希链。
 	// entry_hash = SHA256(seq || timestamp || action || request_digest
 	//                     || decision || reason || prev_hash)
+	// 注意 (FIX-C 固化): 本校验对"尾部截断"不可知——删除末尾记录后剩余链仍
+	// 哈希自洽返回 valid=true。巡检方必须将返回的 tip_hash / entries_checked
+	// 与自身持久化的上次链头比对, 才能发现尾部删除。
 	VerifyAuditChain(context.Context, *VerifyAuditChainRequest) (*VerifyAuditChainResponse, error)
 	// 健康度与运行态巡检 (版本 / 时钟 / 白名单规模 / 审计链 tip)。
 	GetSignerHealth(context.Context, *GetSignerHealthRequest) (*GetSignerHealthResponse, error)
+	// 生成新的热钱包密钥对 (RELAYER/PAYOUT)。signer 经 KMS 生成 secp256k1
+	// 私钥, AES-256-GCM 信封加密落 encrypted_keys, 仅返回派生地址。
+	// 私钥永不离开 signer 进程边界。role 仅接受 "RELAYER"/"PAYOUT"。
+	GenerateWallet(context.Context, *GenerateWalletRequest) (*GenerateWalletResponse, error)
+	// 动态更新指定链的冷钱包白名单 (COLD 增删)。幂等; 持久化到 signer
+	// 本地 SQLite cold_wallets 表, 立即影响后续 SWEEP 策略校验。
+	// 轮换窗口 = 新旧地址同时存在于白名单。
+	UpdateColdWallets(context.Context, *UpdateColdWalletsRequest) (*UpdateColdWalletsResponse, error)
+	// 热钱包清单 (signer-cli 运维面的"查") — 仅元数据: 地址 / 角色
+	// 标签 / 创建时间 / 密钥是否已装载可签名。永不返回私钥材料。
+	// 热钱包只增不删 — 密钥均为派生品, 无"改"语义, 故无 Remove RPC。
+	ListWallets(context.Context, *ListWalletsRequest) (*ListWalletsResponse, error)
+	// 查询指定链当前生效的冷钱包白名单 (DB 权威 — 含运行期增删后的
+	// 最新状态, 不受 boot-seed config 影响)。
+	ListColdWallets(context.Context, *ListColdWalletsRequest) (*ListColdWalletsResponse, error)
 	mustEmbedUnimplementedVaultSignerServiceServer()
 }
 
@@ -174,6 +272,18 @@ func (UnimplementedVaultSignerServiceServer) VerifyAuditChain(context.Context, *
 }
 func (UnimplementedVaultSignerServiceServer) GetSignerHealth(context.Context, *GetSignerHealthRequest) (*GetSignerHealthResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetSignerHealth not implemented")
+}
+func (UnimplementedVaultSignerServiceServer) GenerateWallet(context.Context, *GenerateWalletRequest) (*GenerateWalletResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GenerateWallet not implemented")
+}
+func (UnimplementedVaultSignerServiceServer) UpdateColdWallets(context.Context, *UpdateColdWalletsRequest) (*UpdateColdWalletsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpdateColdWallets not implemented")
+}
+func (UnimplementedVaultSignerServiceServer) ListWallets(context.Context, *ListWalletsRequest) (*ListWalletsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListWallets not implemented")
+}
+func (UnimplementedVaultSignerServiceServer) ListColdWallets(context.Context, *ListColdWalletsRequest) (*ListColdWalletsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListColdWallets not implemented")
 }
 func (UnimplementedVaultSignerServiceServer) mustEmbedUnimplementedVaultSignerServiceServer() {}
 func (UnimplementedVaultSignerServiceServer) testEmbeddedByValue()                            {}
@@ -286,6 +396,78 @@ func _VaultSignerService_GetSignerHealth_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _VaultSignerService_GenerateWallet_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GenerateWalletRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VaultSignerServiceServer).GenerateWallet(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VaultSignerService_GenerateWallet_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VaultSignerServiceServer).GenerateWallet(ctx, req.(*GenerateWalletRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VaultSignerService_UpdateColdWallets_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpdateColdWalletsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VaultSignerServiceServer).UpdateColdWallets(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VaultSignerService_UpdateColdWallets_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VaultSignerServiceServer).UpdateColdWallets(ctx, req.(*UpdateColdWalletsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VaultSignerService_ListWallets_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListWalletsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VaultSignerServiceServer).ListWallets(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VaultSignerService_ListWallets_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VaultSignerServiceServer).ListWallets(ctx, req.(*ListWalletsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _VaultSignerService_ListColdWallets_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListColdWalletsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(VaultSignerServiceServer).ListColdWallets(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: VaultSignerService_ListColdWallets_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(VaultSignerServiceServer).ListColdWallets(ctx, req.(*ListColdWalletsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // VaultSignerService_ServiceDesc is the grpc.ServiceDesc for VaultSignerService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -312,6 +494,22 @@ var VaultSignerService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetSignerHealth",
 			Handler:    _VaultSignerService_GetSignerHealth_Handler,
+		},
+		{
+			MethodName: "GenerateWallet",
+			Handler:    _VaultSignerService_GenerateWallet_Handler,
+		},
+		{
+			MethodName: "UpdateColdWallets",
+			Handler:    _VaultSignerService_UpdateColdWallets_Handler,
+		},
+		{
+			MethodName: "ListWallets",
+			Handler:    _VaultSignerService_ListWallets_Handler,
+		},
+		{
+			MethodName: "ListColdWallets",
+			Handler:    _VaultSignerService_ListColdWallets_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -21,7 +21,7 @@ struct SweepItem {
 contract BatchSweeper {
     uint256 public constant MAX_BATCH_ITEMS = 50;
     /// @dev Outer-call gas cap for the per-vault sweep step (§2.2.2).
-    uint256 public constant SWEEP_GAS_CAP = 120_000;
+    uint256 public constant SWEEP_GAS_CAP = 300_000;
     uint256 public constant ROTATION_TIMELOCK = 48 hours;
 
     /// @notice The VaultFactory that deployed this contract (deploys proxies).

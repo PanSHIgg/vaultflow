@@ -8,6 +8,7 @@ import type {
   Balance,
   DepositAddress,
   DepositPage,
+  Withdrawal,
 } from "./types";
 
 export class ApiError extends Error {
@@ -85,4 +86,19 @@ export function listDeposits(q: { chain_id?: number; cursor?: string } = {}): Pr
 
 export function listBalances(): Promise<Balance[]> {
   return request("GET", "/v1/me/balances");
+}
+
+export function createWithdrawal(req: {
+  chain_id: number;
+  token_symbol: string;
+  to_address: string;
+  /** Atomic units (NUMERIC(78,0) decimal string). */
+  amount: string;
+  idempotency_key?: string;
+}): Promise<Withdrawal> {
+  return request("POST", "/v1/me/withdrawals", { body: req });
+}
+
+export function listWithdrawals(): Promise<Withdrawal[]> {
+  return request("GET", "/v1/me/withdrawals");
 }
